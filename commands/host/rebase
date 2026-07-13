@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+target=main
+if [ $# -gt 0 ]; then
+    case "$1" in
+        -*) ;;
+        *) target="$1"; shift ;;
+    esac
+fi
+
+prompt=$(cat <<EOF
+Carefully rebase the current branch onto '${target}'.
+
+Preconditions — stop and report instead of proceeding if any fails:
+- The working tree must be clean (git status). Never stash or discard changes on your own.
+- '${target}' must exist as a local ref.
+- Record the current branch name and the output of 'git rev-parse HEAD' so the pre-rebase state can be restored from the reflog if anything goes wrong.
+
+Then run: git rebase '${target}'
+
+For every conflict:
+- Read both sides and the surrounding code; understand the intent of each change before resolving.
+- Preserve the intent of BOTH branches — never blindly take ours/theirs.
+- If a resolution is genuinely ambiguous, pause and ask me rather than guessing.
+
+After the rebase completes:
+- Run the project's build and test commands (if the project has them) to verify the result.
+- Summarize: which commits were replayed, each conflict and how you resolved it, the verification outcome, and the recovery SHA recorded earlier.
+
+Never push. If the rebase becomes unrecoverable, run 'git rebase --abort' and explain what happened.
+EOF
+)
+
+exec "${ENCLAVE_BIN:-enclave}" run "$@" "$prompt"

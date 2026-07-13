@@ -1,0 +1,7 @@
+schemaVersion: "1"
+kind: mixin
+name: neovim
+displayName: Neovim
+description: Neovim editor with sensible defaults
+defaultEnabled: false
+priority: 85

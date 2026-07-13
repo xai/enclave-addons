@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Install enclave add-ons from this repository onto the local machine.
+#
+# Usage: ./install.sh <add-on>...
+#
+# Extensions (features/, tools/) are copied into the enclave user extension
+# root and, for opt-in features, enabled in the global enclave config; run
+# `enclave --rebuild` afterwards to bake them into the image. User commands
+# (commands/) are copied into the enclave commands directory instead and are
+# available immediately, no rebuild needed.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+case "$(uname -s)" in
+    Darwin) CONFIG_ROOT="$HOME/Library/Application Support/org.eclipse.enclave/config" ;;
+    *)      CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/enclave" ;;
+esac
+EXT_ROOT="$CONFIG_ROOT/extensions"
+CONFIG_FILE="$CONFIG_ROOT/config.json"
+
+list_addons() {
+    local kind_dir dir cmd
+    for kind_dir in features tools; do
+        for dir in "$SCRIPT_DIR/$kind_dir"/*/; do
+            [ -f "${dir}spec.yaml" ] && printf '  %-20s (%s)\n' "$(basename "$dir")" "${kind_dir%s}"
+        done
+    done
+    for kind_dir in host session; do
+        for cmd in "$SCRIPT_DIR/commands/$kind_dir"/*; do
+            [ -f "$cmd" ] && [ -x "$cmd" ] && printf '  %-20s (%s command)\n' "$(basename "$cmd")" "$kind_dir"
+        done
+    done
+}
+
+usage() {
+    echo "Usage: $(basename "$0") <add-on>..."
+    echo
+    echo "Available add-ons:"
+    list_addons
+}
+
+# Echo the kind directory (features|tools) containing the named extension.
+find_extension() {
+    local name="$1" kind_dir
+    for kind_dir in features tools; do
+        if [ -f "$SCRIPT_DIR/$kind_dir/$name/spec.yaml" ]; then
+            echo "$kind_dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Echo the kind (host|session) of the named user command.
+find_command() {
+    local name="$1" kind
+    for kind in host session; do
+        if [ -f "$SCRIPT_DIR/commands/$kind/$name" ] && [ -x "$SCRIPT_DIR/commands/$kind/$name" ]; then
+            echo "$kind"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Install a user command into the enclave commands directory. Enclave
+# discovers it at CLI parse time, so it works immediately without a rebuild.
+install_command() {
+    local name="$1" kind="$2" dest
+    dest="$CONFIG_ROOT/commands/$kind/$name"
+    mkdir -p "$(dirname "$dest")"
+    cp "$SCRIPT_DIR/commands/$kind/$name" "$dest"
+    chmod +x "$dest"
+    echo "Installed '$name' to $dest"
+    echo "'$name' is available immediately as: enclave $name"
+}
+
+# Add "+<name>" to the features array in the global config, creating the
+# config file if needed. Only the features array is touched; all other keys
+# are preserved. Idempotent.
+enable_feature() {
+    local name="$1" entry="+$1" tmp
+
+    # enclave treats a missing or blank config file the same way: no config.
+    if [ ! -f "$CONFIG_FILE" ] || ! grep -q '[^[:space:]]' "$CONFIG_FILE"; then
+        printf '{ "features": ["%s"] }\n' "$entry" > "$CONFIG_FILE"
+        echo "Enabled '$name' in $CONFIG_FILE (created)"
+        return 0
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+        tmp="$(mktemp)"
+        if ! jq --arg f "$entry" \
+            '.features = ((.features // []) | if index($f) then . else . + [$f] end)' \
+            "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            manual_enable_hint "$entry"
+            return 1
+        fi
+        mv "$tmp" "$CONFIG_FILE"
+    elif command -v python3 >/dev/null 2>&1; then
+        if ! python3 - "$CONFIG_FILE" "$entry" <<'PY'
+import json, sys
+path, entry = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except ValueError:
+    sys.exit(1)
+if not isinstance(cfg, dict):
+    sys.exit(1)
+features = cfg.setdefault("features", [])
+if not isinstance(features, list):
+    sys.exit(1)
+if entry not in features:
+    features.append(entry)
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+        then
+            manual_enable_hint "$entry"
+            return 1
+        fi
+    else
+        echo "Warning: neither jq nor python3 found; add \"$entry\" to the" >&2
+        echo "\"features\" array in $CONFIG_FILE manually." >&2
+        return 0
+    fi
+    echo "Enabled '$name' in $CONFIG_FILE"
+}
+
+manual_enable_hint() {
+    echo "Error: could not update $CONFIG_FILE (invalid JSON, or \"features\"" >&2
+    echo "is not an array). The file was left unchanged; add \"$1\" to its" >&2
+    echo "\"features\" array manually." >&2
+}
+
+install_addon() {
+    local name="$1" kind_dir src dest spec
+
+    if ! kind_dir="$(find_extension "$name")"; then
+        if kind_dir="$(find_command "$name")"; then
+            install_command "$name" "$kind_dir"
+            return 0
+        fi
+        echo "Error: unknown add-on '$name'" >&2
+        echo >&2
+        echo "Available add-ons:" >&2
+        list_addons >&2
+        return 1
+    fi
+
+    src="$SCRIPT_DIR/$kind_dir/$name"
+    dest="$EXT_ROOT/$kind_dir/$name"
+    spec="$src/spec.yaml"
+
+    mkdir -p "$(dirname "$dest")"
+    rm -rf "$dest"
+    cp -R "$src" "$dest"
+    [ -f "$dest/install.sh" ] && chmod +x "$dest/install.sh"
+    echo "Installed '$name' to $dest"
+    needs_rebuild=1
+
+    if grep -Eq '^kind:[[:space:]]*mixin' "$spec"; then
+        if grep -Eq '^defaultEnabled:[[:space:]]*true' "$spec"; then
+            echo "'$name' is enabled by default; no config change needed"
+        else
+            enable_feature "$name"
+        fi
+    else
+        echo "'$name' is a tool; run it with: enclave --tool $name"
+    fi
+}
+
+if [ "$#" -eq 0 ]; then
+    usage >&2
+    exit 1
+fi
+
+failed=0
+needs_rebuild=0
+for name in "$@"; do
+    install_addon "$name" || failed=1
+done
+[ "$failed" -eq 0 ] || exit 1
+
+echo
+if command -v enclave >/dev/null 2>&1; then
+    enclave validate-extensions
+fi
+if [ "$needs_rebuild" -eq 1 ]; then
+    echo "Done. Run 'enclave --rebuild' to bake the extensions into the image"
+    echo "(or 'enclave update --rebuild' to rebuild without starting a session)."
+else
+    echo "Done."
+fi

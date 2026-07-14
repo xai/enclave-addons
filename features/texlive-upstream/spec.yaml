@@ -1,0 +1,16 @@
+schemaVersion: "1"
+kind: mixin
+name: texlive-upstream
+displayName: TeX Live (upstream)
+description: Official TeX Live release from TUG/CTAN, pinnable via TEXLIVE_RELEASE in install.sh
+defaultEnabled: false
+priority: 75
+failOnInstallError: true
+aptPackages:
+  - perl                        # install-tl and latexmk are perl scripts
+  - curl
+  - ca-certificates
+  - fontconfig                  # system font discovery for xelatex/lualatex
+  - ghostscript                 # not bundled with TeX Live on Linux
+  - python3-pygments            # minted
+  - poppler-utils               # pdftoppm/pdfinfo: render built PDFs to images

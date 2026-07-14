@@ -1,0 +1,26 @@
+schemaVersion: "1"
+kind: mixin
+name: texlive-debian
+displayName: TeX Live (Debian)
+description: TeX Live from Debian packages for math/CS papers (beamer, TikZ, biblatex, latexmk)
+defaultEnabled: false
+priority: 70
+aptPackages:
+  - texlive-latex-recommended   # LaTeX core plus beamer, booktabs, caption, ...
+  - texlive-latex-extra         # cleveref, enumitem, todonotes, minted, ...
+  - texlive-science             # algorithm2e, algorithmicx, siunitx, ...
+  - texlive-pictures            # pgf/TikZ, pgfplots
+  - texlive-publishers          # IEEEtran, acmart, and other publisher classes
+  - texlive-bibtex-extra        # biblatex and bibliography styles
+  - texlive-luatex
+  - texlive-xetex
+  - texlive-plain-generic
+  - texlive-fonts-recommended
+  - texlive-fonts-extra         # largest chunk; libertine/inconsolata needed by acmart
+  - lmodern
+  - cm-super
+  - biber
+  - latexmk
+  - ghostscript
+  - python3-pygments            # minted
+  - poppler-utils               # pdftoppm/pdfinfo: render built PDFs to images

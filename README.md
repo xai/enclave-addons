@@ -35,6 +35,8 @@ Run `./install.sh` without arguments to list the available add-ons.
 | Name | Kind | Description |
 | --- | --- | --- |
 | [neovim](features/neovim/) | feature | Neovim editor with lazy.nvim and sensible defaults |
+| [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
+| [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
 
 ## Updating
@@ -78,7 +80,9 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │   └── host/
 │       └── rebase
 ├── features/           # kind: mixin — tooling available to all agents
-│   └── neovim/
+│   ├── neovim/
+│   ├── texlive-debian/
+│   └── texlive-upstream/
 └── tools/              # kind: sandbox — runnable agents (none yet)
 ```
 

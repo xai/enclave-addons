@@ -38,6 +38,7 @@ Run `./install.sh` without arguments to list the available add-ons.
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
+| [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 
 ## Updating
 
@@ -78,7 +79,8 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 ├── install.sh          # generic installer: ./install.sh <name>...
 ├── commands/           # user commands: enclave <name>
 │   └── host/
-│       └── rebase
+│       ├── rebase
+│       └── triage
 ├── features/           # kind: mixin — tooling available to all agents
 │   ├── neovim/
 │   ├── texlive-debian/

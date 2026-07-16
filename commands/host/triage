@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+prompt=$(cat <<'EOF'
+Triage unaddressed review feedback for the current branch, then fix the findings I select.
+
+Step 1 - GitHub PR feedback:
+- Determine whether the current branch belongs to a pull request on GitHub (try 'gh pr view' first, falling back to 'gh pr list --head <branch>'). If 'gh' is unavailable, the remote is not on GitHub, or there is no PR, note that briefly and continue with step 2.
+- If there is a PR, collect feedback that may still need addressing: unresolved review threads (thread resolution is only exposed via the GraphQL API — query 'reviewThreads' with 'isResolved'), reviews requesting changes, and PR comments that ask for something.
+- Verify every claim against the current code before accepting it: a comment may already be addressed by a later commit, or may simply be wrong. Only verified, still-open issues become findings; keep track of the claims you dismissed and why.
+
+Step 2 - local review notes:
+- If the repository has a '.reviews/' directory, work out how review rounds are organized (naming, numbering, timestamps), and read only the most recent round(s) — not the whole history.
+- Extract issues that are unresolved or have no recorded resolution, and verify against the current code whether each one is actually still open. Only verified, still-open issues become findings.
+
+Step 3 - report and let me choose:
+- If steps 1 and 2 produced no findings, say so, briefly mention anything you dismissed and why, and stop.
+- Otherwise print a concise numbered list of findings, ordered by the priority you assess (correctness and security first, then functional issues, then style and nits). One entry per finding: a one-line summary, the affected file(s), and the source (PR thread/comment with author, or the .reviews/ file).
+- After the list, briefly note any claims you dismissed as invalid or already addressed.
+- Then ask me which findings to fix and commit: 'none', a set of numbers (e.g. '1 3'), or 'all'. Do not change anything before I answer.
+
+Step 4 - fix and commit the selection:
+- The working tree must be clean before you start (git status); if it is not, stop and ask instead of mixing unrelated changes into commits.
+- Fix only the selected findings, keeping each change minimal and consistent with the surrounding code.
+- Run the project's build and test commands (if the project has them) to verify the fixes.
+- Commit in focused commits (one per finding or per closely related group) with messages that say which finding they address.
+- Never push, and never resolve GitHub threads or reply to comments yourself. Finish with a short summary: what was fixed in which commit, what was skipped, and the verification outcome.
+EOF
+)
+
+exec "${ENCLAVE_BIN:-enclave}" run "$@" "$prompt"

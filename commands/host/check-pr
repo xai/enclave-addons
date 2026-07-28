@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+# shellcheck source=lib/enclave-cmd.sh
+. "${0%/*}/lib/enclave-cmd.sh"
+
+enclave_cmd_summary="Gather all feedback on the current branch's GitHub PR, verify it against the
+code, then ask whether to review the diff, fix the open findings, or stop.
+Read-only on GitHub; commits locally, never pushes."
+
+prompt=$(cat <<'EOF'
+Check the GitHub PR for the current branch, gather all its feedback, and let me decide what happens next.
+
+You can read from GitHub with the gh CLI (the token is for reading only). You have no ssh access to the git remote, so you cannot fetch, pull, or push. Never perform write actions on GitHub: no pushing, no replies, no reviews, no resolving threads, no edits.
+
+Step 1 - find the PR:
+- Determine whether the current branch belongs to an open pull request on GitHub (try 'gh pr view' first, falling back to 'gh pr list --head <branch>'). If 'gh' is unavailable, the remote is not on GitHub, there is no PR, or the PR is closed or merged, report that briefly and stop.
+
+Step 2 - verify local branch and PR head match:
+- Compare 'git rev-parse HEAD' against the PR head ('gh pr view --json headRefOid'), and check for uncommitted changes to tracked files (untracked files are fine).
+- If they do not match exactly, stop — you cannot sync the branch yourself. Work out whether local is ahead, behind, or diverged without fetching (e.g. 'git cat-file -e <sha>' and 'git merge-base --is-ancestor' with the PR head SHA), report both SHAs, and tell me exactly what to run to get back in sync (fetch + reset, push, or commit/stash) before re-running this command.
+
+Step 3 - gather the full PR picture:
+- 'gh pr view --json number,title,body,author,state,isDraft,baseRefName,headRefName,headRefOid,url,createdAt,comments,reviews,reviewDecision,commits,statusCheckRollup' for metadata, description, top-level comments, and reviews.
+- Also fetch inline review comments including their resolution state; thread resolution is only exposed via the GraphQL API — query 'reviewThreads' with 'isResolved'.
+- Verify feedback against the current code before treating it as open: a comment may already be addressed by a later commit, or may simply be wrong.
+
+Step 4 - decide which actions apply:
+- 'review' applies if no human has reviewed the PR yet, or if commits were added after the most recent human review (compare the newest commit's committedDate with the newest human review's submittedAt). Ignore bot reviews (logins ending in [bot], Copilot and the like) when deciding this.
+- 'fix' applies only if the PR was opened by me AND there is verified unaddressed feedback: unresolved threads, changes-requested reviews, or comments asking for something the current code does not yet satisfy. Establish who I am with 'gh api user --jq .login' and compare it against the PR author; if that call fails, say so and treat 'fix' as not applicable rather than guessing.
+- Neither, one, or both may apply.
+
+Step 5 - report and ask:
+- Start with a super-brief summary (bullet points or at most 5 sentences): who opened the PR and how long it has been open, what it does, and what has happened since the most recent human review — or since the PR was opened, if never reviewed (new commits, new comments, CI state).
+- List the open feedback you found, noting claims you dismissed as already addressed or invalid and why.
+- If neither action applies, say the PR needs nothing right now and stop.
+- Otherwise state which action(s) apply and why, give your recommendation, and ask me how to continue: 'review', 'fix' (only if applicable), or 'stop'. Do not start either action before I answer.
+- If I pick 'review': thoroughly review the full PR diff against its base and report findings ranked most severe first, each with file:line references.
+- If I pick 'fix': fix the verified findings with minimal, focused commits (one per finding or closely related group), verify with the project's build and test commands if it has them, and finish with a summary of what was fixed in which commit. Local commits are fine; pushing is not.
+EOF
+)
+
+enclave_run "$prompt" "$@"

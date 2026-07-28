@@ -1,0 +1,36 @@
+# shellcheck shell=sh
+# shellcheck disable=SC2034  # read by enclave-cmd.sh, which sources this file
+#
+# Machine-local defaults for the host commands. Copy this file to
+# enclave-cmd.local.sh next to it (dropping the .example suffix) and edit.
+#
+# install.sh never writes enclave-cmd.local.sh, so reinstalling or updating the
+# add-ons repository leaves your settings alone. Point ENCLAVE_CMD_CONFIG at a
+# different path to keep it elsewhere.
+#
+# Precedence, lowest to highest:
+#   1. the library's own defaults (no tool, no flags)
+#   2. the globals below
+#   3. the tool a command declares for itself
+#   4. the per-command overrides below
+#   5. ENCLAVE_CMD_TOOL / ENCLAVE_CMD_ARGS in the environment
+#   6. --tool and -- flags on the command line
+#
+# Setting a tool anywhere drops the flags that came with the previous one, since
+# tool flags rarely transfer between tools. Declare both together.
+
+# Applies to every command that does not declare a tool of its own.
+enclave_cmd_tool=claude
+enclave_cmd_args="--model opus"
+
+# Per command, named after the command with non-alphanumerics replaced by '_'
+# (check-pr becomes check_pr). These win over what the command declares, so use
+# them to retune a command without editing the installed file.
+#enclave_cmd_tool_rebase=claude
+#enclave_cmd_args_rebase="--model opus --effort high"
+
+#enclave_cmd_tool_check_pr=codex
+
+# An empty (but set) flags variable keeps the tool's own defaults instead of
+# inheriting the globals above.
+#enclave_cmd_args_triage=

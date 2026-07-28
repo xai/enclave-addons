@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+# shellcheck source=lib/enclave-cmd.sh
+. "${0%/*}/lib/enclave-cmd.sh"
+
+enclave_cmd_summary="Rebase the current branch onto <target> (default: main), resolving each conflict
+by preserving the intent of both sides and pausing when genuinely ambiguous,
+then verify with the project's build and tests. Never pushes."
+enclave_cmd_synopsis="[<target>]"
+
 target=main
 if [ $# -gt 0 ]; then
     case "$1" in
@@ -32,4 +40,4 @@ Never push. If the rebase becomes unrecoverable, run 'git rebase --abort' and ex
 EOF
 )
 
-exec "${ENCLAVE_BIN:-enclave}" run "$@" "$prompt"
+enclave_run "$prompt" "$@"

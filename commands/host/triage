@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+# shellcheck source=lib/enclave-cmd.sh
+. "${0%/*}/lib/enclave-cmd.sh"
+
+enclave_cmd_summary="Collect still-open review feedback from the GitHub PR and the latest .reviews/
+round, verify each claim against the code, then fix and commit the findings you
+select. Never pushes and never touches GitHub threads."
+
 prompt=$(cat <<'EOF'
 Triage unaddressed review feedback for the current branch, then fix the findings I select.
 
@@ -28,4 +35,4 @@ Step 4 - fix and commit the selection:
 EOF
 )
 
-exec "${ENCLAVE_BIN:-enclave}" run "$@" "$prompt"
+enclave_run "$prompt" "$@"

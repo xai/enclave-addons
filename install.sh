@@ -64,6 +64,30 @@ find_command() {
     return 1
 }
 
+# Install the shared command library next to the installed commands. Commands
+# source it by relative path, so it has to travel with them. enclave-cmd.sh is
+# overwritten on every install; enclave-cmd.local.sh belongs to the machine and
+# is never touched.
+install_command_lib() {
+    local kind="$1" src_dir dest_dir file
+    case " $installed_libs " in
+        *" $kind "*) return 0 ;;
+    esac
+    src_dir="$SCRIPT_DIR/commands/$kind/lib"
+    [ -d "$src_dir" ] || return 0
+    dest_dir="$CONFIG_ROOT/commands/$kind/lib"
+    mkdir -p "$dest_dir"
+    for file in "$src_dir"/*; do
+        [ -f "$file" ] || continue
+        case "$(basename "$file")" in
+            *.local.sh) continue ;;
+        esac
+        cp "$file" "$dest_dir/"
+    done
+    installed_libs="$installed_libs $kind"
+    echo "Installed the shared command library to $dest_dir"
+}
+
 # Install a user command into the enclave commands directory. Enclave
 # discovers it at CLI parse time, so it works immediately without a rebuild.
 install_command() {
@@ -73,6 +97,7 @@ install_command() {
     cp "$SCRIPT_DIR/commands/$kind/$name" "$dest"
     chmod +x "$dest"
     echo "Installed '$name' to $dest"
+    install_command_lib "$kind"
     echo "'$name' is available immediately as: enclave $name"
 }
 
@@ -181,6 +206,7 @@ fi
 
 failed=0
 needs_rebuild=0
+installed_libs=
 for name in "$@"; do
     install_addon "$name" || failed=1
 done

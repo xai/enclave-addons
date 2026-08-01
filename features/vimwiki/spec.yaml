@@ -1,0 +1,11 @@
+schemaVersion: "1"
+kind: mixin
+name: vimwiki
+displayName: Vimwiki
+description: Vimwiki plugin for Neovim, active only inside unlocked vimwiki sessions
+# x-install-mode: per-run -- install.sh must NOT add this feature to the
+# global config: baked into every image, the plugin would ship in every
+# container. Select it per run instead: --features +neovim,+vimwiki
+defaultEnabled: false
+priority: 90
+failOnInstallError: true

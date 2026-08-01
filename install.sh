@@ -5,9 +5,12 @@
 #
 # Extensions (features/, tools/) are copied into the enclave user extension
 # root and, for opt-in features, enabled in the global enclave config; run
-# `enclave --rebuild` afterwards to bake them into the image. User commands
-# (commands/) are copied into the enclave commands directory instead and are
-# available immediately, no rebuild needed.
+# `enclave --rebuild` afterwards to bake them into the image. Features whose
+# spec carries an `# x-install-mode: per-run` comment are never enabled in
+# the global config -- they are meant to be selected per run with
+# `--features +<name>`. User commands (commands/) are copied into the
+# enclave commands directory instead and are available immediately, no
+# rebuild needed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,16 +43,22 @@ usage() {
     list_addons
 }
 
-# Echo the kind directory (features|tools) containing the named extension.
+# Echo the kind directories (features|tools) containing the named extension,
+# one per line. $1 may be qualified ("features/<name>" / "tools/<name>") to
+# force a single kind; a bare name matches every kind it exists in (a feature
+# and a tool may legitimately share a name, e.g. neovim).
 find_extension() {
-    local name="$1" kind_dir
-    for kind_dir in features tools; do
+    local name="$1" kinds="features tools" kind_dir found=1
+    case "$name" in
+        features/*|tools/*) kinds=${name%%/*}; name=${name#*/} ;;
+    esac
+    for kind_dir in $kinds; do
         if [ -f "$SCRIPT_DIR/$kind_dir/$name/spec.yaml" ]; then
             echo "$kind_dir"
-            return 0
+            found=0
         fi
     done
-    return 1
+    return "$found"
 }
 
 # Echo the kind (host|session) of the named user command.
@@ -163,40 +172,52 @@ manual_enable_hint() {
 }
 
 install_addon() {
-    local name="$1" kind_dir src dest spec
+    local arg="$1" name kinds kind_dir src dest spec
 
-    if ! kind_dir="$(find_extension "$name")"; then
+    name=$arg
+    case "$arg" in
+        features/*|tools/*) name=${arg#*/} ;;
+    esac
+
+    if ! kinds="$(find_extension "$arg")"; then
         if kind_dir="$(find_command "$name")"; then
             install_command "$name" "$kind_dir"
             return 0
         fi
-        echo "Error: unknown add-on '$name'" >&2
+        echo "Error: unknown add-on '$arg'" >&2
         echo >&2
         echo "Available add-ons:" >&2
         list_addons >&2
         return 1
     fi
 
-    src="$SCRIPT_DIR/$kind_dir/$name"
-    dest="$EXT_ROOT/$kind_dir/$name"
-    spec="$src/spec.yaml"
+    # A bare name installs every kind it matches; qualify as features/<name>
+    # or tools/<name> to pick one.
+    for kind_dir in $kinds; do
+        src="$SCRIPT_DIR/$kind_dir/$name"
+        dest="$EXT_ROOT/$kind_dir/$name"
+        spec="$src/spec.yaml"
 
-    mkdir -p "$(dirname "$dest")"
-    rm -rf "$dest"
-    cp -R "$src" "$dest"
-    [ -f "$dest/install.sh" ] && chmod +x "$dest/install.sh"
-    echo "Installed '$name' to $dest"
-    needs_rebuild=1
+        mkdir -p "$(dirname "$dest")"
+        rm -rf "$dest"
+        cp -R "$src" "$dest"
+        [ -f "$dest/install.sh" ] && chmod +x "$dest/install.sh"
+        echo "Installed ${kind_dir%s} '$name' to $dest"
+        needs_rebuild=1
 
-    if grep -Eq '^kind:[[:space:]]*mixin' "$spec"; then
-        if grep -Eq '^defaultEnabled:[[:space:]]*true' "$spec"; then
-            echo "'$name' is enabled by default; no config change needed"
+        if grep -Eq '^kind:[[:space:]]*mixin' "$spec"; then
+            if grep -Eq '^defaultEnabled:[[:space:]]*true' "$spec"; then
+                echo "'$name' is enabled by default; no config change needed"
+            elif grep -Eq '^#[[:space:]]*x-install-mode:[[:space:]]*per-run' "$spec"; then
+                echo "'$name' is a per-run feature; NOT enabled in the global config."
+                echo "Select it per run with: enclave --features +$name[,...]"
+            else
+                enable_feature "$name"
+            fi
         else
-            enable_feature "$name"
+            echo "'$name' is a tool; run it with: enclave --tool $name"
         fi
-    else
-        echo "'$name' is a tool; run it with: enclave --tool $name"
-    fi
+    done
 }
 
 if [ "$#" -eq 0 ]; then

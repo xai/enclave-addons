@@ -1,0 +1,11 @@
+schemaVersion: "1"
+kind: sandbox
+name: neovim
+displayName: Neovim
+description: Neovim as the session tool, for editor-only sandboxes
+
+# No configDir, deliberately: nvim's runtime state (shada, undofile, swap)
+# can embed edited file contents. For the encrypted-vimwiki workflow that
+# state must die with the container, not persist to a host-side store.
+sandbox:
+  entrypoint: { run: [nvim] }

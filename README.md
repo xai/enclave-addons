@@ -18,8 +18,10 @@ Clone this repository and run the install script with the add-ons you want:
 The script copies extensions into the enclave user extension root
 (`~/.config/enclave/extensions/` on Linux,
 `~/Library/Application Support/org.eclipse.enclave/config/extensions/` on
-macOS) and enables opt-in features in your global enclave config. Afterwards,
-bake them into the image:
+macOS) and enables opt-in features in your global enclave config — except
+features whose spec is marked `# x-install-mode: per-run`, which stay out of
+the global config and are selected per run with `--features +<name>`.
+Afterwards, bake them into the image:
 
 ```bash
 enclave --rebuild
@@ -30,13 +32,17 @@ and become available immediately as `enclave <name>` — no rebuild needed. Host
 commands also bring along the shared library they source,
 `commands/host/lib/enclave-cmd.sh`.
 
-Run `./install.sh` without arguments to list the available add-ons.
+Run `./install.sh` without arguments to list the available add-ons. A
+feature and a tool may share a name (e.g. `neovim`); a bare name installs
+every kind it matches, and `features/<name>` / `tools/<name>` picks one.
 
 ## Available add-ons
 
 | Name | Kind | Description |
 | --- | --- | --- |
 | [neovim](features/neovim/) | feature | Neovim editor with lazy.nvim and sensible defaults |
+| [vimwiki](features/vimwiki/) | feature | Vimwiki plugin on top of the neovim feature; dormant outside unlocked vimwiki sessions. Per-run feature: select with `--features +neovim,+vimwiki`, never enabled globally |
+| [neovim (tool)](tools/neovim/) | tool | `enclave --tool neovim` — Neovim as the session tool, for editor-only sandboxes |
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
@@ -137,15 +143,21 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 ├── features/           # kind: mixin — tooling available to all agents
 │   ├── neovim/
 │   ├── texlive-debian/
-│   └── texlive-upstream/
-└── tools/              # kind: sandbox — runnable agents (none yet)
+│   ├── texlive-upstream/
+│   └── vimwiki/
+└── tools/              # kind: sandbox — runnable session tools
+    └── neovim/
 ```
 
 ## Adding an add-on
 
 Create `features/<name>/` (or `tools/<name>/`) with a `spec.yaml` following
 the [extension format](https://github.com/eclipsesource/yoloarena/blob/main/docs/extensions/README.md),
-add a `README.md`, and list the add-on in the table above. For a user
+add a `README.md`, and list the add-on in the table above. A feature that
+should never live in the global `features` array (because it only makes
+sense for particular runs) declares that with a spec comment line
+`# x-install-mode: per-run`; the installer then copies it without enabling
+it. For a user
 command, add an executable file `commands/host/<name>` (runs on the host)
 or `commands/session/<name>` (runs in the container). The install script
 discovers add-ons by directory or file name, so no installer change is

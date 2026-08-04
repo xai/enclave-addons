@@ -18,23 +18,53 @@ Clone this repository and run the install script with the add-ons you want:
 The script copies extensions into the enclave user extension root
 (`~/.config/enclave/extensions/` on Linux,
 `~/Library/Application Support/org.eclipse.enclave/config/extensions/` on
-macOS) and enables opt-in features in your global enclave config — except
-features whose spec is marked `# x-install-mode: per-run`, which stay out of
-the global config and are selected per run with `--features +<name>`.
-Afterwards, bake them into the image:
-
-```bash
-enclave --rebuild
-```
-
-User commands are copied into `commands/` in the enclave config root instead
-and become available immediately as `enclave <name>` — no rebuild needed. Host
+macOS). User commands go to `commands/` in the enclave config root instead and
+become available immediately as `enclave <name>` — no rebuild needed. Host
 commands also bring along the shared library they source,
 `commands/host/lib/enclave-cmd.sh`.
 
 Run `./install.sh` without arguments to list the available add-ons. A
 feature and a tool may share a name (e.g. `neovim`); a bare name installs
 every kind it matches, and `features/<name>` / `tools/<name>` picks one.
+
+## Installing is not activating
+
+Copying a feature onto your machine does not put it in any image. An opt-in
+feature is inactive until it is listed in the `features` array of an enclave
+config, and the installer does not write that list unless you ask it to — a
+600 MB toolchain like [java](features/java/) belongs in the sessions that need
+it, not in every container you start.
+
+So after installing, pick one:
+
+```bash
+# per session — nothing global changes
+enclave --features "+java" --rebuild
+
+# per project — ~/.config/enclave/projects/<hash>/config.json
+{ "features": ["+java"] }
+
+# every session — the global config, ~/.config/enclave/config.json
+{ "features": ["+java"] }
+```
+
+`--rebuild` is needed the first time a session uses a feature set that has not
+been built yet. Comma-separate `--features` to select several
+(`--features "+neovim,+java"`), and remember that additive `+`/`-` entries
+modify the default-enabled set rather than replacing it.
+
+`--enable` lets the installer write the global entry for you, for a feature you
+do want everywhere:
+
+```bash
+./install.sh --enable diffity
+enclave --rebuild
+```
+
+It only ever appends `"+<name>"` to the `features` array and leaves the rest of
+the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
+[vimwiki](features/vimwiki/) today) is never enabled from here, not even with
+`--enable`.
 
 ## Available add-ons
 
@@ -106,11 +136,16 @@ git pull
 enclave --rebuild
 ```
 
+Re-installing never changes your enablement: a feature already in the global
+`features` array stays there and is reported as such, and one you selected per
+session stays out of the config.
+
 ## Removing an add-on
 
-Delete an extension from the user extension root, drop its `+<name>` entry
-from the `features` array in your global config
-(`~/.config/enclave/config.json` on Linux), and rebuild:
+Delete an extension from the user extension root, drop its `+<name>` entry from
+the `features` array in your global config (`~/.config/enclave/config.json` on
+Linux) if it has one — the installer never removes entries, so an entry you or
+`--enable` added outlives the extension — and rebuild:
 
 ```bash
 rm -rf ~/.config/enclave/extensions/features/neovim
@@ -157,11 +192,11 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 
 Create `features/<name>/` (or `tools/<name>/`) with a `spec.yaml` following
 the [extension format](https://github.com/eclipsesource/yoloarena/blob/main/docs/extensions/README.md),
-add a `README.md`, and list the add-on in the table above. A feature that
-should never live in the global `features` array (because it only makes
-sense for particular runs) declares that with a spec comment line
-`# x-install-mode: per-run`; the installer then copies it without enabling
-it. For a user
+add a `README.md`, and list the add-on in the table above. A feature that must
+never live in the global `features` array (because it only makes sense for
+particular runs, not merely because it is large) declares that with a spec
+comment line `# x-install-mode: per-run`; `--enable` then refuses it and the
+installer prints the per-run invocation instead. For a user
 command, add an executable file `commands/host/<name>` (runs on the host)
 or `commands/session/<name>` (runs in the container). The install script
 discovers add-ons by directory or file name, so no installer change is

@@ -22,6 +22,9 @@ To pin a specific Neovim release, edit `NEOVIM_VERSION` in `install.sh`
 (default: `stable`). To change plugins or settings, edit the heredocs in
 `install.sh` and rebuild.
 
-The feature is opt-in (`defaultEnabled: false`). The repository install
-script enables it in your global enclave config; see the
+The feature is opt-in (`defaultEnabled: false`), and installing it does not
+activate it: `./install.sh neovim` only copies it onto your machine. Select it
+for the sessions that want it with `enclave --features "+neovim"`, or add
+`"+neovim"` to the `features` array in your global config for every session
+(`./install.sh --enable neovim` writes that entry for you). See the
 [repository README](../../README.md).

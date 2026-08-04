@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # Install enclave add-ons from this repository onto the local machine.
 #
-# Usage: ./install.sh <add-on>...
+# Usage: ./install.sh [--enable] <add-on>...
 #
 # Extensions (features/, tools/) are copied into the enclave user extension
-# root and, for opt-in features, enabled in the global enclave config; run
-# `enclave --rebuild` afterwards to bake them into the image. Features whose
-# spec carries an `# x-install-mode: per-run` comment are never enabled in
-# the global config -- they are meant to be selected per run with
-# `--features +<name>`. User commands (commands/) are copied into the
-# enclave commands directory instead and are available immediately, no
-# rebuild needed.
+# root. Installing is not activating: an opt-in feature stays inactive until
+# it is listed in the global enclave config, and this script only does that
+# when asked with --enable. Without it, the feature is on the machine and
+# every session decides for itself with `enclave --features "+<name>"` --
+# which is what you want for a toolchain only some sessions need.
+#
+# `~/.config/enclave/config.json` is the user's file either way; the script
+# prints what to add rather than assuming. Features whose spec carries an
+# `# x-install-mode: per-run` comment are never enabled from here at all,
+# not even with --enable.
+#
+# User commands (commands/) are copied into the enclave commands directory
+# instead and are available immediately, no rebuild needed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,10 +40,20 @@ list_addons() {
             [ -f "$cmd" ] && [ -x "$cmd" ] && printf '  %-20s (%s command)\n' "$(basename "$cmd")" "$kind_dir"
         done
     done
+    # The last test above is routinely false (commands/host/lib/ is skipped),
+    # and a lister has no business reporting that as failure: errexit would
+    # take down a caller that only wanted to print usage.
+    return 0
 }
 
 usage() {
-    echo "Usage: $(basename "$0") <add-on>..."
+    echo "Usage: $(basename "$0") [--enable] <add-on>..."
+    echo
+    echo "Options:"
+    echo "  -e, --enable   also activate installed opt-in features in"
+    echo "                 $CONFIG_FILE"
+    echo "                 (default: install only, and print how to activate)"
+    echo "  -h, --help     this message"
     echo
     echo "Available add-ons:"
     list_addons
@@ -171,8 +187,49 @@ manual_enable_hint() {
     echo "\"features\" array manually." >&2
 }
 
+# Return 0 if the global config's features array already activates <name>,
+# either as "<name>" or as the additive "+<name>". An explicit "-<name>"
+# is not activation. Returns 1 when the answer cannot be determined (no
+# config, unreadable JSON, no jq and no python3) -- the caller only uses
+# this to phrase a message, never to decide what to write.
+feature_enabled() {
+    local name="$1"
+    [ -f "$CONFIG_FILE" ] || return 1
+
+    if command -v jq >/dev/null 2>&1; then
+        jq -e --arg n "$name" \
+            '((.features // []) | (index($n) // index("+" + $n))) != null' \
+            "$CONFIG_FILE" >/dev/null 2>&1
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$CONFIG_FILE" "$name" <<'PY'
+import json, sys
+path, name = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+features = cfg.get("features") if isinstance(cfg, dict) else None
+if not isinstance(features, list):
+    sys.exit(1)
+sys.exit(0 if name in features or "+" + name in features else 1)
+PY
+    else
+        return 1
+    fi
+}
+
+# How to activate a feature this script installed but left inactive. Both
+# routes are the user's to take; neither needs another run of this script.
+activation_hint() {
+    local name="$1"
+    echo "  for selected sessions: enclave --features \"+$name\" --rebuild"
+    echo "  or for every session:  add \"+$name\" to the \"features\" array in"
+    echo "                         $CONFIG_FILE"
+}
+
 install_addon() {
-    local arg="$1" name kinds kind_dir src dest spec
+    local arg="$1" name kinds kind_dir src dest spec status=0
 
     name=$arg
     case "$arg" in
@@ -208,27 +265,63 @@ install_addon() {
         if grep -Eq '^kind:[[:space:]]*mixin' "$spec"; then
             if grep -Eq '^defaultEnabled:[[:space:]]*true' "$spec"; then
                 echo "'$name' is enabled by default; no config change needed"
+                activated=1
             elif grep -Eq '^#[[:space:]]*x-install-mode:[[:space:]]*per-run' "$spec"; then
-                echo "'$name' is a per-run feature; NOT enabled in the global config."
-                echo "Select it per run with: enclave --features +$name[,...]"
+                if [ "$enable" -eq 1 ]; then
+                    echo "'$name' is a per-run feature; not enabled in the global config," \
+                         "not even with --enable."
+                else
+                    echo "'$name' is a per-run feature; not enabled in the global config."
+                fi
+                echo "Select it per run with: enclave --features \"+$name\" --rebuild"
+            elif [ "$enable" -eq 1 ]; then
+                if enable_feature "$name"; then
+                    activated=1
+                else
+                    status=1
+                fi
+            elif feature_enabled "$name"; then
+                echo "'$name' is already enabled in $CONFIG_FILE; left as it is"
+                activated=1
             else
-                enable_feature "$name"
+                echo "'$name' is installed but not enabled. To activate it:"
+                activation_hint "$name"
             fi
         else
             echo "'$name' is a tool; run it with: enclave --tool $name"
         fi
     done
+
+    return "$status"
 }
 
-if [ "$#" -eq 0 ]; then
+# --enable may appear anywhere; add-on names never start with a dash.
+enable=0
+names=()
+for arg in "$@"; do
+    case "$arg" in
+        -e|--enable) enable=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)
+            echo "Error: unknown option '$arg'" >&2
+            echo >&2
+            usage >&2
+            exit 2
+            ;;
+        *) names+=("$arg") ;;
+    esac
+done
+
+if [ "${#names[@]}" -eq 0 ]; then
     usage >&2
     exit 1
 fi
 
 failed=0
 needs_rebuild=0
+activated=0
 installed_libs=
-for name in "$@"; do
+for name in "${names[@]}"; do
     install_addon "$name" || failed=1
 done
 [ "$failed" -eq 0 ] || exit 1
@@ -237,9 +330,13 @@ echo
 if command -v enclave >/dev/null 2>&1; then
     enclave validate-extensions
 fi
-if [ "$needs_rebuild" -eq 1 ]; then
-    echo "Done. Run 'enclave --rebuild' to bake the extensions into the image"
+if [ "$activated" -eq 1 ]; then
+    echo "Done. Run 'enclave --rebuild' to bake the enabled extensions into the image"
     echo "(or 'enclave update --rebuild' to rebuild without starting a session)."
+elif [ "$needs_rebuild" -eq 1 ]; then
+    echo "Done. Nothing was added to $CONFIG_FILE, so the"
+    echo "default image is unchanged. Select what you installed per session"
+    echo "(--features \"+<name>\" / --tool <name>), with --rebuild the first time."
 else
     echo "Done."
 fi

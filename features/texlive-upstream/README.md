@@ -42,11 +42,13 @@ knobs are variables at the top of `install.sh` (same pattern as
 After editing, re-run `./install.sh texlive-upstream` from the repository
 and rebuild with `enclave --rebuild`.
 
-The feature is opt-in (`defaultEnabled: false`). The repository install
-script enables it in your global enclave config; see the
-[repository README](../../README.md). To enable it only for selected
-projects, remove `"+texlive-upstream"` from the global `features` array and
-add it to `~/.config/enclave/projects/<hash>/config.json` instead.
+The feature is opt-in (`defaultEnabled: false`), and installing it does not
+activate it: `./install.sh texlive-upstream` only copies it onto your machine.
+Select it per session with `enclave --features "+texlive-upstream"`, or make it
+permanent by adding `"+texlive-upstream"` to the `features` array in your global
+config (`./install.sh --enable texlive-upstream` writes that entry for you) or
+in `~/.config/enclave/projects/<hash>/config.json` for one project only. See the
+[repository README](../../README.md).
 
 ## Coexistence with texlive-debian
 

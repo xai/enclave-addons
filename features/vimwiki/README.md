@@ -27,6 +27,7 @@ enclave --tool neovim --features +neovim,+vimwiki
 ```
 
 The repo installer respects that (`x-install-mode: per-run` in the spec): it
-copies the extension but does not touch the global config. The `neovim`
-feature must be part of the same selection — `install.sh` fails the image
-build otherwise (`failOnInstallError: true`).
+copies the extension but never adds it to the global config, not even when
+called with `--enable`. The `neovim` feature must be part of the same
+selection — `install.sh` fails the image build otherwise
+(`failOnInstallError: true`).

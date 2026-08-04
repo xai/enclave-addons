@@ -95,11 +95,19 @@ JDK, Gradle, and Maven are all still there.
 
 ## Enablement
 
-Opt-in (`defaultEnabled: false`). The repository install script enables it in
-your global enclave config; see the [repository README](../../README.md).
+Opt-in (`defaultEnabled: false`), and installing it does not activate it — which
+is the point for a 600 MB toolchain that only some projects need:
 
 ```bash
-./install.sh java
+./install.sh java                       # copy it onto the machine
+enclave --features "+java" --rebuild    # and use it in the sessions that want it
+```
+
+To have it in every session instead, add `"+java"` to the `features` array in
+your global config, or let the installer do it:
+
+```bash
+./install.sh --enable java
 enclave --rebuild
 ```
 
@@ -109,3 +117,5 @@ For the editor integration, install and select neovim alongside it:
 ./install.sh java neovim
 enclave --tool neovim --features "+neovim,+java" --rebuild
 ```
+
+See the [repository README](../../README.md) for the installer's rules.

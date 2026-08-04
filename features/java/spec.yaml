@@ -1,0 +1,16 @@
+schemaVersion: "1"
+kind: mixin
+name: java
+displayName: Java (Temurin)
+description: Eclipse Temurin JDK with Gradle, Maven, and the Eclipse JDT language server, all from upstream
+defaultEnabled: false
+# After neovim (85), so install.sh can drop an nvim-jdtls spec into that
+# feature's config when both are selected. Nothing else depends on the order.
+priority: 88
+failOnInstallError: true
+aptPackages:
+  - curl
+  - ca-certificates
+  - unzip                       # Gradle ships as a zip, not a tarball
+  - jq                          # Adoptium and Gradle publish release metadata as JSON
+  - python3                     # jdtls' bin/jdtls launcher is a python script

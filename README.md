@@ -46,6 +46,7 @@ every kind it matches, and `features/<name>` / `tools/<name>` picks one.
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [diffity](features/diffity/) | feature | GitHub-style diff viewer and code review UI, with `/diffity-*` skills for every skill-capable Enclave tool |
+| [java](features/java/) | feature | Eclipse Temurin JDK (current LTS) with Gradle, Maven, and the Eclipse JDT language server, all from upstream |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
@@ -143,6 +144,7 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │       └── triage
 ├── features/           # kind: mixin — tooling available to all agents
 │   ├── diffity/
+│   ├── java/
 │   ├── neovim/
 │   ├── texlive-debian/
 │   ├── texlive-upstream/

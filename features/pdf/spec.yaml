@@ -1,0 +1,32 @@
+schemaVersion: "1"
+kind: mixin
+name: pdf
+displayName: PDF tools
+description: Text, structure, rendering, and OCR for PDFs, with a /pdf skill and pdf-probe to pick the right one
+defaultEnabled: false
+# Nothing depends on this feature and it depends on nothing, so the number is
+# only there to keep the order deterministic.
+priority: 65
+failOnInstallError: true
+aptPackages:
+  # Three extraction stacks that overlap far less than their names suggest.
+  - poppler-utils               # pdftotext/pdftoppm/pdfinfo/pdfimages/pdffonts/pdfseparate/pdfunite
+  - qpdf                        # structure: decrypt, repair, page ranges, --json object dump
+  - mupdf-tools                 # mutool: a second rendering engine, repair, raw object inspection
+  - pdfgrep                     # search a tree of PDFs without extracting each one first
+  - ghostscript                 # downsample and repair; also ocrmypdf's rasteriser
+  # pandoc cannot read PDF; it is here for the far end of the pipeline, turning
+  # pdftohtml output into markdown that keeps headings, lists, and emphasis.
+  # Debian only recommends texlive-latex-* from it, and enclave installs with
+  # --no-install-recommends, so this stays ~150 MB instead of dragging in TeX.
+  - pandoc
+  # OCR, for the scans where every extractor above returns nothing.
+  - ocrmypdf                    # adds a text layer in place, keeping the original page images
+  - tesseract-ocr
+  - tesseract-ocr-eng
+  - tesseract-ocr-deu
+  - unpaper                     # ocrmypdf --clean: descreen and despeckle before recognition
+  - img2pdf                     # images back into a PDF, losslessly (ocrmypdf uses it too)
+  # Substitutes for the fonts a PDF names but does not embed. Without these,
+  # pdftoppm renders such pages in a default face and the layout drifts.
+  - fonts-liberation

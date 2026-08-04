@@ -1,0 +1,48 @@
+schemaVersion: "1"
+kind: mixin
+name: python-data
+displayName: Python data libraries
+description: Importable Python libraries for analysis scripts - networkx, BeautifulSoup, matplotlib, BibTeX parsers - plus the graphviz layout engines
+defaultEnabled: false
+# The stock python-dev feature (priority 70) installs linters and formatters
+# with `uv tool install`, which puts each one in its own venv. Nothing it
+# installs is importable, and nothing here is a command-line tool, so the two
+# features do not overlap despite the similar names. No ordering dependency
+# either way; this number only keeps the build deterministic.
+priority: 68
+failOnInstallError: true
+aptPackages:
+  # Everything is an apt python3-* package rather than pip or uv: Debian's
+  # system Python is externally managed (PEP 668), so `pip install` fails
+  # outright, and a venv would only be importable by scripts that know to look
+  # for it. These land in the system site-packages, where `python3 script.py`
+  # finds them with no ceremony.
+
+  # --- HTML ------------------------------------------------------------------
+  - python3-bs4                 # the parser API; needs one of the parsers below
+  - python3-lxml                # fast and strict: the default choice
+  - python3-html5lib            # slow and forgiving, for markup lxml rejects
+
+  # --- Graphs ----------------------------------------------------------------
+  - python3-networkx            # centrality, communities, shortest paths, layouts
+  - graphviz                    # dot, neato, sfdp, fdp, twopi, circo
+  - python3-pygraphviz          # nx.nx_agraph.graphviz_layout -- the maintained binding
+  - python3-pydot               # nx.nx_pydot, and reading/writing .dot files
+  # networkx only *recommends* numpy and scipy, and enclave installs with
+  # --no-install-recommends, so both have to be named here. Without scipy,
+  # nx.pagerank raises and spring_layout fails on graphs past a few hundred
+  # nodes -- exactly the two things a co-authorship analysis reaches for.
+  - python3-numpy
+  - python3-scipy
+
+  # --- Plots -----------------------------------------------------------------
+  - python3-matplotlib          # feature-entrypoint.d pins the Agg backend
+
+  # --- BibTeX ----------------------------------------------------------------
+  # Both, because they answer different questions: pybtex has the more complete
+  # grammar and is what to reach for when the file is untrusted, bibtexparser
+  # keeps entries as plain dicts and round-trips them. See the /python-data
+  # skill for which to use when -- and note Debian ships bibtexparser 1.4.3
+  # behind a 2.0.0b5 version string, so the v2 API is not available.
+  - python3-pybtex
+  - python3-bibtexparser

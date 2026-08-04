@@ -1,10 +1,10 @@
 # Enclave Add-ons
 
-Add-ons for [enclave](https://github.com/eclipsesource/yoloarena) that are
+Add-ons for [enclave](https://github.com/eclipse-enclave/enclave) that are
 not bundled with the main repository:
-[user extensions](https://github.com/eclipsesource/yoloarena/blob/main/docs/extensions/README.md#extension-sources)
+[user extensions](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/README.md#extension-sources)
 (features and tools) and
-[user commands](https://github.com/eclipsesource/yoloarena/blob/main/docs/ARCHITECTURE.md#key-concepts)
+[user commands](https://github.com/eclipse-enclave/enclave/blob/main/docs/ARCHITECTURE.md#key-concepts)
 (`enclave <name>` subcommands).
 
 ## Installation
@@ -77,6 +77,8 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [diffity](features/diffity/) | feature | GitHub-style diff viewer and code review UI, with `/diffity-*` skills for every skill-capable Enclave tool |
 | [java](features/java/) | feature | Eclipse Temurin JDK (current LTS) with Gradle, Maven, and the Eclipse JDT language server, all from upstream |
+| [pdf](features/pdf/) | feature | PDF text, structure, rendering, OCR, and conversion (poppler, qpdf, mutool, pdfgrep, ocrmypdf, pandoc), with a `/pdf` skill and `pdf-probe` to pick the right tool |
+| [python-data](features/python-data/) | feature | Importable Python libraries for analysis scripts — networkx with graphviz, BeautifulSoup, matplotlib, BibTeX parsers — with a `/python-data` skill. Complements the stock `python-dev`, whose `uv tool` installs are not importable |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
@@ -116,8 +118,8 @@ enclave_cmd_args_rebase="--model opus --effort high"
 ```
 
 Per command is worth the two lines where the work justifies it — conflict
-resolution in `rebase` or a full review in `slopreview` reward a stronger model
-than skimming a PR does.
+resolution in `rebase` or verifying a review's findings in `triage` reward a
+stronger model than skimming a PR does.
 
 `install.sh` writes `enclave-cmd.sh` but never `enclave-cmd.local.sh`, so
 updating this repository leaves those settings alone. Per-command entries
@@ -181,6 +183,8 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │   ├── diffity/
 │   ├── java/
 │   ├── neovim/
+│   ├── pdf/
+│   ├── python-data/
 │   ├── texlive-debian/
 │   ├── texlive-upstream/
 │   └── vimwiki/
@@ -191,8 +195,25 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 ## Adding an add-on
 
 Create `features/<name>/` (or `tools/<name>/`) with a `spec.yaml` following
-the [extension format](https://github.com/eclipsesource/yoloarena/blob/main/docs/extensions/README.md),
-add a `README.md`, and list the add-on in the table above. A feature that must
+the [extension format](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/README.md),
+add a `README.md`, and list the add-on in the table above.
+
+**Pick a name no built-in extension uses.** When an extension exists in both
+the built-in and the user-global root, [user files win, per file](https://github.com/eclipse-enclave/enclave/blob/main/docs/extensions/README.md#extension-sources) —
+so a name clash silently replaces enclave's `spec.yaml` and `install.sh` with
+yours rather than reporting a conflict. Taken today:
+
+| Kind | Reserved by enclave |
+| --- | --- |
+| feature | `devtools`, `debug-tools`, `github-cli`, `gitlab-cli`, `node-dev`, `playwright`, `python-dev`, `shell-extras` |
+| tool | `claude`, `codex`, `mistral-vibe`, `opencode`, `pi`, `theia`, `theia-next` |
+
+Check the list against your enclave checkout before adding one, since it grows.
+A near-miss is fine and can be deliberate: `python-data` sits beside the stock
+`python-dev` precisely to signpost that they are different halves of the same
+job.
+
+A feature that must
 never live in the global `features` array (because it only makes sense for
 particular runs, not merely because it is large) declares that with a spec
 comment line `# x-install-mode: per-run`; `--enable` then refuses it and the
@@ -245,3 +266,14 @@ ENCLAVE_BIN=echo ./commands/host/rebase -- --model sonnet
 # the source directive needs SCRIPTDIR to resolve
 find commands -type f -exec shellcheck -x --source-path=SCRIPTDIR {} +
 ```
+
+## License
+
+[MIT](LICENSE), matching
+[enclave](https://github.com/eclipse-enclave/enclave) itself.
+
+Vendored files that carry their own notice keep it, and the repository licence
+does not override them: the diffity skills under
+[`features/diffity/skills/`](features/diffity/skills/) are upstream's, MIT, and
+covered by
+[`LICENSE.upstream`](features/diffity/skills/LICENSE.upstream) beside them.

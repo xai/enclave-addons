@@ -45,6 +45,7 @@ every kind it matches, and `features/<name>` / `tools/<name>` picks one.
 | [neovim (tool)](tools/neovim/) | tool | `enclave --tool neovim` — Neovim as the session tool, for editor-only sandboxes |
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
+| [diffity](features/diffity/) | feature | GitHub-style diff viewer and code review UI, with `/diffity-*` skills for every skill-capable Enclave tool |
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
@@ -141,6 +142,7 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │       ├── rebase
 │       └── triage
 ├── features/           # kind: mixin — tooling available to all agents
+│   ├── diffity/
 │   ├── neovim/
 │   ├── texlive-debian/
 │   ├── texlive-upstream/
@@ -164,6 +166,12 @@ discovers add-ons by directory or file name, so no installer change is
 needed. Files under `commands/host/lib/` are not add-ons — enclave skips
 subdirectories when discovering commands, and the installer treats the
 directory as a dependency of the commands rather than as an entry of its own.
+
+A feature may ship agent skills as subdirectories of `features/<name>/skills/`.
+When that feature is enabled, Enclave composes those directories into every
+session tool that declares `sandbox.skillsDir`; tools without a managed skill
+interface ignore them. Non-directory entries are not installed as skills, so a
+feature can keep an upstream license or provenance notice beside them.
 
 A host command that drives an agent is a prompt around the library:
 

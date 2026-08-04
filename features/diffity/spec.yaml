@@ -1,0 +1,22 @@
+schemaVersion: "1"
+kind: mixin
+name: diffity
+displayName: Diffity
+description: GitHub-style diff viewer and code review UI, with the agent skills that drive it
+defaultEnabled: false
+priority: 75
+failOnInstallError: true
+
+ports:
+  # hostAllocation: auto, not fixed: the feature is enabled globally, so a
+  # fixed host port would make any two concurrent sessions collide on 5391 and
+  # fail the second one at container start. The cost is that the URL diffity
+  # prints in the container is not the one to open -- use the one enclave
+  # prints, or `enclave ps`. Diffity listens on the container wildcard address;
+  # enclave publishes it on host loopback by default. Do not remap this UI to a
+  # non-loopback host address: it can read and modify the mounted repository.
+  - container: 5391
+    publish: true
+    hostAllocation: auto
+    label: Diffity
+    openUrl: "http://localhost:{host_port}"

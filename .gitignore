@@ -1,0 +1,6 @@
+# Local drafts and review scratch, written by agent skills and host commands
+# for the author to read before publishing. They quote code and discussion
+# from wherever the work happened, so they stay out of this public repository.
+.issues/
+.prs/
+.reviews/

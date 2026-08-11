@@ -23,9 +23,10 @@ You are starting the diffity diff viewer so the user can inspect changes in a ho
    - If it does not exist, start `diffity --no-open <ref>` (or `diffity --no-open` if no ref) as a long-running background command using the current tool's shell execution facility. Do not use `--new` when there is nothing to replace.
    Do not use `--quiet`.
 5. If a server was started, wait 2 seconds, then run `diffity list --json` and verify that the requested instance is running for the current repository. The reported port is container-local; do not give it to the user.
-6. Tell the user diffity is running and direct them to Enclave's published URL. If a mismatched session was replaced, say so explicitly before the usual message. Keep it short and do not show session IDs, hashes, container ports, or other internals. Examples:
+6. Take the `ref` field of that entry and build the path `/diff?ref=<ref>`, using the registry value verbatim (`/diff?ref=work` for a working-tree session, `/diff?ref=main..HEAD` for that comparison). The user must open this path, not the bare URL: the UI reads the ref from the query string and falls back to the working tree when it is missing, so the bare URL shows "No changes found" on a clean tree no matter which diff the server is serving.
+7. Tell the user diffity is running and direct them to Enclave's published URL with that path appended. If a mismatched session was replaced, say so explicitly before the usual message. Keep it short and do not show session IDs, hashes, container ports, or other internals. Examples:
 
-   > Diffity is running. Open the Diffity URL Enclave printed at session start, or run `enclave ps` on the host to see it.
+   > Diffity is running. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host to see it) and add `/diff?ref=main..HEAD` to it.
    >
    > When you're ready:
    > - Leave comments on the diff in your browser, then run **/diffity-resolve** to fix them
@@ -33,4 +34,4 @@ You are starting the diffity diff viewer so the user can inspect changes in a ho
 
    Or, after a replacement:
 
-   > Replaced the running tree session with the requested diff session. Open the Diffity URL Enclave printed at session start, or run `enclave ps` on the host to see it.
+   > Replaced the running tree session with the requested diff session. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host to see it) and add `/diff?ref=main..HEAD` to it.

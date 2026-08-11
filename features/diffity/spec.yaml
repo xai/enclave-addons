@@ -13,8 +13,15 @@ ports:
   # fail the second one at container start. The cost is that the URL diffity
   # prints in the container is not the one to open -- use the one enclave
   # prints, or `enclave ps`. Diffity listens on the container wildcard address;
-  # enclave publishes it on host loopback by default. Do not remap this UI to a
-  # non-loopback host address: it can read and modify the mounted repository.
+  # enclave publishes it on host loopback by default, which is where it belongs:
+  # this UI has no authentication and can read and modify the mounted
+  # repository. Overriding that for a single invocation is documented in
+  # README.md, "Notes"; never do it here, and never in the config.
+  #
+  # openUrl is the origin only. The port is published before any diffity server
+  # runs, so it cannot carry a ref, and the UI treats a missing ref as the
+  # working tree -- the bare URL reads as "No changes found" on a clean tree.
+  # The skills append /diff?ref=<ref> or /tree; see README.md, "Notes".
   - container: 5391
     publish: true
     hostAllocation: auto

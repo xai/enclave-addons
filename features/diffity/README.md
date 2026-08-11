@@ -32,6 +32,31 @@ feature adds nothing to the gateway allowlist. GitHub PR workflows shell out to
 - **Open the URL Enclave printed**, not the one diffity printed. The host port
   is assigned by the daemon and differs from the container's 5391. Run
   `enclave ps` on the host to recover the current URL.
+- **Append the route and ref to that URL.** Enclave can only publish the
+  origin: the port exists before any diffity server does, so `openUrl` cannot
+  carry the ref of a session the agent starts later. The UI reads the ref from
+  the query string and falls back to the working tree when it is absent, so the
+  bare URL shows "No changes found" on a clean tree even while the server is
+  serving a different diff. Take the `ref` field from `diffity list --json` and
+  open `<url>/diff?ref=<ref>` — `/diff?ref=main..HEAD` for that comparison,
+  `/diff?ref=work` for a working-tree session, `/tree` for a tree session
+  (`ref: "__tree__"`). The skills report the right path; this is the rule they
+  follow.
+- The host port is auto-assigned, so it changes between sessions and the ones
+  Docker hands out are reused across them. Pin it with `-p 15391:5391` (or
+  `"ports": ["15391:5391"]` in the config) when you want a stable bookmark:
+  the feature's declared port dedups on the container port and steps aside for
+  an explicit mapping. Only do this if you run one diffity session at a time —
+  a fixed host port is what `hostAllocation: auto` exists to avoid, and the
+  second concurrent session fails at container start.
+- The same mapping takes an explicit host IP, which is the only way to reach
+  the UI from another machine: `-p 0.0.0.0:0:5391` binds every interface and
+  still lets the daemon pick the host port, `-p 0.0.0.0:15391:5391` fixes both.
+  Per invocation only — never put it in the config and never change `openUrl`.
+  The UI has no authentication and can read and modify the mounted repository,
+  and Docker's published-port rules sit in front of most host firewalls, so
+  this hands the repository to anything that can route to the host. Enclave
+  still prints the URL as `localhost`; substitute the host's address.
 - There is no browser in the container. Browser launches attempted by
   `diffity`, `diffity tree`, and `diffity open` fail silently while the server
   continues to run. `/diffity-diff` and `/diffity-tree` now pass `--no-open`,

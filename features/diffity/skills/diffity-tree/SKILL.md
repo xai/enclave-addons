@@ -18,13 +18,13 @@ You are starting the diffity file tree so the user can browse repository files i
    - If it does not exist, start `diffity tree --no-open` as a long-running background command using the current tool's shell execution facility. Do not use `--new` when there is nothing to replace.
    Do not use `--quiet`.
 4. If a server was started, wait 2 seconds, then run `diffity list --json` and verify that the current repository now has an entry with `ref: "__tree__"`. The reported port is container-local; do not give it to the user.
-5. Tell the user diffity tree is running and direct them to Enclave's published URL. If a diff session was replaced, say so explicitly before the usual message. Keep it short and do not show session IDs, hashes, container ports, or other internals. Examples:
+5. Tell the user diffity tree is running and direct them to Enclave's published URL with `/tree` appended. The tree is a separate route: the bare URL lands on the diff view, which defaults to the working tree and shows "No changes found" when it is clean. If a diff session was replaced, say so explicitly before the usual message. Keep it short and do not show session IDs, hashes, container ports, or other internals. Examples:
 
-   > Diffity tree is running. Open the Diffity URL Enclave printed at session start, or run `enclave ps` on the host to see it.
+   > Diffity tree is running. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host to see it) and add `/tree` to it.
    >
    > When you're ready:
    > - Leave comments on any file in your browser, then run **/diffity-resolve-tree** to fix them
 
    Or, after a replacement:
 
-   > Replaced the running diff session with a tree session. Open the Diffity URL Enclave printed at session start, or run `enclave ps` on the host to see it.
+   > Replaced the running diff session with a tree session. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host to see it) and add `/tree` to it.

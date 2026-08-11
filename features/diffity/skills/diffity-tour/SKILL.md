@@ -238,9 +238,10 @@ The tour UI has a dedicated explanation panel. The intro (from `tour-start --bod
 ### Phase 3: Hand off to the host browser
 
 1. Do not run a browser-opening command and do not print a URL using the port from `diffity list --json`. That port is container-local, while Enclave publishes a different host port.
-2. Tell the user the tour is ready and direct them to the Diffity URL Enclave printed at session start, or to `enclave ps` on the host:
+2. Build the path the tour lives on from the session's `ref` field in `diffity list --json`. It is `/tree` for a tree session (`ref: "__tree__"`) and `/diff?ref=<ref>` for a diff session, using the registry value verbatim. The user must open this path, not the bare URL: the bare URL lands on the diff view with no ref, which falls back to the working tree and shows "No changes found" when it is clean.
+3. Tell the user the tour is ready and direct them to the Diffity URL Enclave printed at session start (or `enclave ps` on the host) with that path appended:
 
-   > Your tour is ready. Open the Diffity URL Enclave printed at session start, or run `enclave ps` on the host.
+   > Your tour is ready. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host) and add `/tree` to it.
 
 ## Concept tours
 

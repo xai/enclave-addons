@@ -53,6 +53,13 @@ for this session's repository and for every repository the store already holds.
 `registry.json` stays container-local, deliberately: it lists running instances
 by PID and port, and both belong to the container that produced them.
 
+Only the session's own repository gets its hash computed. A second repository
+reviewed in the same session — one reached through `--add-dir` — persists only
+once the store holds a directory for it, because the entrypoint links what is
+already there. To seed one, create `<store>/<hash>` on the host, where `<hash>`
+is `printf %s <repo-root> | sha256sum | cut -c1-12` for the path the repository
+has *inside* the container.
+
 This mirrors a layout diffity owns, and diffity has moved it before. An earlier
 version of this feature linked `~/.diffity/reviews.db`, a path 0.9.5 no longer
 writes, and every review died with its container while the store sat empty.

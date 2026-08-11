@@ -202,8 +202,9 @@ If a repeated pattern appears across files, comment on the first occurrence and 
 ### Step 4: Hand off to the host browser
 
 1. Do not run `diffity open` and do not print the container-local URL. The browser is on the host, and Enclave assigns a different host port.
-2. Build the path `/diff?ref=<ref>` from the `ref` field the session reports in `diffity list --json`, using that value verbatim (`/diff?ref=work` for a working-tree session, `/diff?ref=main..HEAD` for that comparison). The user must open this path, not the bare URL: the UI reads the ref from the query string and falls back to the working tree when it is missing, so the bare URL shows "No changes found" on a clean tree and the comments are nowhere to be seen.
-3. Tell the user the review is ready and direct them to the Diffity URL Enclave printed at session start (or `enclave ps` on the host) with that path appended. If Step 1 replaced a mismatched session, say so explicitly before the review summary. Example:
+2. Verify persistence: take the session's `repoHash` from `diffity list --json` and run `readlink "$HOME/.diffity/<repoHash>"`. If it prints nothing, that path is not a link into the host store, so the comments you just left are container-local and vanish with the session. Lead with that. It means the feature's link no longer matches diffity's layout — a feature bug to report, not something to repair from inside the session.
+3. Build the path `/diff?ref=<ref>` from the `ref` field the session reports in `diffity list --json`, using that value verbatim (`/diff?ref=work` for a working-tree session, `/diff?ref=main..HEAD` for that comparison). The user must open this path, not the bare URL: the UI reads the ref from the query string and falls back to the working tree when it is missing, so the bare URL shows "No changes found" on a clean tree and the comments are nowhere to be seen.
+4. Tell the user the review is ready and direct them to the Diffity URL Enclave printed at session start (or `enclave ps` on the host) with that path appended. If Step 1 replaced a mismatched session, say so explicitly before the review summary. Example:
 
    > Review complete. Open the Diffity URL Enclave printed at session start (or run `enclave ps` on the host) and add `/diff?ref=main..HEAD` to it.
    >

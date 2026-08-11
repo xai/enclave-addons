@@ -73,6 +73,16 @@ database instead of getting one each. Keep the store on a local filesystem:
 concurrent WAL access needs working POSIX locks and shared memory, so a store
 on NFS or SMB corrupts or fails.
 
+The skills check this too. Every skill that starts a server compares the
+running session's `repoHash` against `~/.diffity/<repo-hash>` and says so
+before handing off if that path is not a link into the store, so a layout
+change surfaces on the first review rather than the first time reviews are
+missing.
+
+Nothing backs the store up. It is one SQLite database on one host, and the
+threads in it exist nowhere else — copy the directory somewhere durable while
+no session is running if losing them would hurt.
+
 The session start-up prints where reviews for this repository live, or a
 warning naming the reason they will not persist — an unmounted
 `ENCLAVE_DIFFITY_STORE`, a store the container user cannot write, a workspace

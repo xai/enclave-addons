@@ -111,10 +111,18 @@ if [ -n "$_diffity_store" ]; then
         if [ ! -e "$HOME/.diffity/$_diffity_hash" ] && [ ! -L "$HOME/.diffity/$_diffity_hash" ]; then
             ln -s "$_diffity_store/$_diffity_hash" "$HOME/.diffity/$_diffity_hash" 2>/dev/null || true
         fi
-        if [ -d "$HOME/.diffity/$_diffity_hash" ]; then
+        # Claim persistence only when the entry resolves into the store. A real
+        # directory sitting at that path -- left by an image, another
+        # entrypoint fragment, or a diffity that stopped following this layout
+        # -- satisfies a -d test while every review still dies with the
+        # container, and this line is what the user is asked to trust.
+        _diffity_target="$(readlink -f "$HOME/.diffity/$_diffity_hash" 2>/dev/null || true)"
+        if [ -L "$HOME/.diffity/$_diffity_hash" ] &&
+            [ -n "$_diffity_target" ] &&
+            [ "$_diffity_target" = "$(readlink -f "$_diffity_store/$_diffity_hash" 2>/dev/null)" ]; then
             echo "Diffity: reviews for $_diffity_repo persist in $_diffity_store/$_diffity_hash"
         else
-            echo "Warning: diffity could not link $HOME/.diffity/$_diffity_hash to the store; reviews for $_diffity_repo will not persist"
+            echo "Warning: $HOME/.diffity/$_diffity_hash is not linked to the store; reviews for $_diffity_repo will not persist"
         fi
     fi
 elif [ -n "${ENCLAVE_TOOL_CONFIG_DIR:-}" ] && [ ! -e "$HOME/.diffity" ]; then
@@ -123,7 +131,7 @@ elif [ -n "${ENCLAVE_TOOL_CONFIG_DIR:-}" ] && [ ! -e "$HOME/.diffity" ]; then
         echo "Warning: no diffity store is mounted; reviews go to the tool config store, which enclave's config overlay can delete at session start. See the Diffity feature README, \"Persisting reviews\""
     fi
 fi
-unset _diffity_store _diffity_candidate _diffity_dir _diffity_name _diffity_repo _diffity_hash _diffity_mp
+unset _diffity_store _diffity_candidate _diffity_dir _diffity_name _diffity_repo _diffity_hash _diffity_target _diffity_mp
 unset -f _diffity_is_mount 2>/dev/null || true
 
 # The registry tracks running instances by PID. PIDs are per-container and get

@@ -14,9 +14,10 @@ agent to resolve them.
 - Publishes container port 5391 to an automatically assigned host-loopback
   port. Enclave prints the resolved URL at session start and shows it in
   `enclave ps` while the session runs.
-- Points `~/.diffity` at the current tool config store, so comment threads and
-  tours survive compatible container restarts, and clears the stale process
-  registry left by the previous container.
+- Puts each repository's review data on a host directory so comment threads and
+  tours outlive the container, and clears the stale process registry the
+  previous one left behind. Mount that directory yourself with `--add-dir`; see
+  "Persisting reviews" below, and do not rely on the fallback location.
 - Ships six upstream-derived skills: `/diffity-diff`, `/diffity-review`,
   `/diffity-resolve`, `/diffity-tree`, `/diffity-resolve-tree`, and
   `/diffity-tour`. Enclave composes them into every enabled tool that declares
@@ -26,6 +27,62 @@ agent to resolve them.
 Normal local diff and review operation makes no outbound requests, so the
 feature adds nothing to the gateway allowlist. GitHub PR workflows shell out to
 `gh`; enable the built-in `github-cli` feature for those.
+
+## Persisting reviews
+
+Create the store once on the host, and mount it in the sessions where you want
+diffity:
+
+```bash
+mkdir -p ~/.local/state/enclave-diffity
+enclave --features "+diffity" --add-dir ~/.local/state/enclave-diffity
+```
+
+Enclave mounts an `--add-dir` directory at the path it has on the host, so the
+entrypoint finds it under the host user's home rather than under `$HOME`. To
+keep the store somewhere else, set `ENCLAVE_DIFFITY_STORE` to that path on the
+host and forward it with `--pass-env ENCLAVE_DIFFITY_STORE`. Put the path in
+`add_dirs` in the global or project config to stop passing the flag; the
+feature still has to be enabled for the session either way.
+
+Diffity keeps everything for one repository in `~/.diffity/<repo-hash>/`, where
+`<repo-hash>` is the first 12 hex characters of sha256 over the repository root
+path: `reviews.db`, the `-wal` and `-shm` files SQLite creates beside it, and
+`current-session`. The entrypoint symlinks that directory into the store, both
+for this session's repository and for every repository the store already holds.
+`registry.json` stays container-local, deliberately: it lists running instances
+by PID and port, and both belong to the container that produced them.
+
+This mirrors a layout diffity owns, and diffity has moved it before. An earlier
+version of this feature linked `~/.diffity/reviews.db`, a path 0.9.5 no longer
+writes, and every review died with its container while the store sat empty.
+After a version bump, compare the directory name the entrypoint prints against
+`repoHash` in `diffity list --json`; if they differ, the layout moved again.
+
+The store is per host directory, not per project. Because diffity keys data by
+the repository root, one directory serves every project, every tool, and every
+session — including two sessions on the same repository, which share one SQLite
+database instead of getting one each. Keep the store on a local filesystem:
+concurrent WAL access needs working POSIX locks and shared memory, so a store
+on NFS or SMB corrupts or fails.
+
+The session start-up prints where reviews for this repository live, or a
+warning naming the reason they will not persist — an unmounted
+`ENCLAVE_DIFFITY_STORE`, a store the container user cannot write, a workspace
+that is not a git checkout, or the fallback below. Read that line; every one of
+these outcomes is otherwise invisible until reviews go missing.
+
+Without `--add-dir`, the database falls back to the tool config store, which is
+where this feature used to keep it. That location is per project, per tool and
+per store key, and with `host_config=passthrough` Enclave's config-source
+overlay deletes everything in it that is not on its preserve list, at session
+start, silently. This has destroyed a populated review database. Treat the
+fallback as "reviews last as long as the container" unless you have checked
+that your sessions run with `host_config=none`.
+
+`eclipse-enclave/enclave#37` replaces all of this with a declared
+`state: true` store, per project and tool-independent. Once it lands, this
+feature should adopt it and the `--add-dir` route can go away.
 
 ## Notes
 
@@ -67,19 +124,21 @@ feature adds nothing to the gateway allowlist. GitHub PR workflows shell out to
   `/diffity-review` inspect the registry first, reuse an exact repo/mode/ref
   match, and use `--new` only when replacing a mismatched session. They report
   a replacement so the user knows the browser and agent CLI changed context.
-- The database is scoped by Enclave's config store: per project, per tool, and
-  per store key. Reviews therefore do not follow a tool switch, and concurrent
-  sessions using suffixed stores do not share reviews. The CLI itself is
-  installed image-wide and remains usable even in a tool without managed
-  skills.
-- Do not run `diffity prune` in a persistent session. It removes the
-  `~/.diffity` symlink rather than the backing store, leaving existing data
-  intact but disabling persistence for the rest of that container session.
-- Under `--backend qemu`, drop the symlink in
-  `feature-entrypoint.d/setup.sh` and let `~/.diffity` stay ephemeral. The
-  review database runs SQLite in WAL mode, and the escape hatch for WAL over a
-  9p-mounted store (`sandbox.qemuStoreCacheMmap`) is tool-only; a mixin cannot
-  request it.
+- The CLI is installed image-wide and remains usable in a tool without managed
+  skills, whether or not a store is mounted.
+- Do not run `diffity prune` in a persistent session. It removes `~/.diffity`
+  wholesale, and the entries that matter there are symlinks: Node does not
+  follow those, so the store keeps its data while the session loses its links
+  to it. Persistence stays off for the rest of that container session, and the
+  next session relinks.
+- Persistence keeps the database, not the session. `current-session` records
+  the ref and the head commit, so new commits on the branch start a fresh
+  session for the new head. Earlier threads stay in the database; they are not
+  listed as current.
+- Under `--backend qemu`, leave the store unmounted and let `~/.diffity` stay
+  ephemeral. The review database runs SQLite in WAL mode, and the escape hatch
+  for WAL over a 9p-mounted store (`sandbox.qemuStoreCacheMmap`) is tool-only;
+  a mixin cannot request it.
 - Never run `npm install -g diffity` or `diffity update` inside a session.
   Both bypass the build-time pin; `diffity update` installs `@latest` using the
   session's Node/npm path and may then suggest replacing the skills. A missing

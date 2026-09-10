@@ -1,0 +1,162 @@
+#!/bin/sh
+#
+# Unlike the other commands here, this one is not a prompt around
+# lib/enclave-cmd.sh: that library ends its invocation with a prompt and has no
+# way to express the port publishing, the forwarded environment, and the tool
+# subcommand this needs.
+
+set -eu
+
+bind=127.0.0.1
+
+usage() {
+    cat <<EOF
+Usage: enclave opencode-web [--bind <address>] [--] [<opencode serve flags>]
+
+Run OpenCode's HTTP server in an enclave session and publish its port to the
+host, so a browser can drive the same sandboxed agent.
+
+Options:
+  --bind <address>  host address to publish the port on (default 127.0.0.1).
+                    0.0.0.0 reaches every interface of this machine; any
+                    non-loopback address requires OPENCODE_SERVER_PASSWORD.
+  -h, --help        this message
+
+Environment:
+  OPENCODE_SERVER_PASSWORD  the server's password, forwarded into the session
+                            with --pass-env. Enclave's env store keeps
+                            --pass-env values on the host (mode 0600) and
+                            reuses them in later sessions, so a rotated
+                            password outlives the session that set it.
+  OPENCODE_SERVER_USERNAME  forwarded alongside it when set.
+
+The port is the first one free at or above 3000 on the bind address, and is
+used on both sides, so the URL OpenCode prints is the URL that works here.
+
+Traffic is plain HTTP: away from loopback, the password and everything the
+agent sends cross the network in the clear. Anyone who reaches the port drives
+an agent that can write to the project, so treat it as a shell on it. Enclave
+installs opencode-ai unpinned, so confirm that the version in your image
+enforces OPENCODE_SERVER_PASSWORD before you publish beyond loopback:
+
+  enclave --tool opencode run -- serve --help
+
+Defined in: $0
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --bind)
+            if [ $# -lt 2 ]; then
+                printf '%s\n' '--bind requires an address.' >&2
+                exit 2
+            fi
+            bind=$2
+            shift 2
+            ;;
+        --bind=*)
+            bind=${1#--bind=}
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Anything not recognizably loopback counts as reachable from elsewhere: the
+# unknown case has to be the guarded one.
+case "$bind" in
+    127.0.0.1|localhost|::1|'[::1]') loopback=1 ;;
+    *) loopback=0 ;;
+esac
+
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    if [ "$loopback" -eq 0 ]; then
+        printf '%s\n' \
+            "OPENCODE_SERVER_PASSWORD must be set to publish OpenCode on $bind." \
+            'Leave --bind at its default to serve on loopback only.' \
+            >&2
+        exit 2
+    fi
+    printf '%s\n' \
+        'OPENCODE_SERVER_PASSWORD is not set: every user on this host can reach' \
+        'the server and the agent behind it.' \
+        >&2
+fi
+
+find_available_port() {
+    if command -v python3 >/dev/null 2>&1; then
+        OPENCODE_WEB_BIND="$bind" python3 - <<'PY'
+import os
+import socket
+
+addr = os.environ["OPENCODE_WEB_BIND"]
+
+for port in range(3000, 65536):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((addr, port))
+        except OSError:
+            continue
+        print(port)
+        break
+else:
+    raise SystemExit("No TCP port is available between 3000 and 65535.")
+PY
+        return
+    fi
+
+    port=3000
+    if command -v ss >/dev/null 2>&1; then
+        while [ "$port" -le 65535 ]; do
+            if [ -z "$(ss -H -ltn "sport = :$port" 2>/dev/null)" ]; then
+                printf '%s\n' "$port"
+                return
+            fi
+            port=$((port + 1))
+        done
+    elif command -v lsof >/dev/null 2>&1; then
+        while [ "$port" -le 65535 ]; do
+            if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+                printf '%s\n' "$port"
+                return
+            fi
+            port=$((port + 1))
+        done
+    else
+        printf '%s\n' 'Finding a free port requires python3, ss, or lsof.' >&2
+        return 1
+    fi
+
+    printf '%s\n' 'No TCP port is available between 3000 and 65535.' >&2
+    return 1
+}
+
+port=$(find_available_port)
+printf 'Publishing %s:%s to the container port %s.\n' "$bind" "$port" "$port" >&2
+
+# The server binds every interface of its own network namespace, which is what
+# the published port forwards to; $bind alone decides who reaches it here.
+if [ -n "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    pass_env=OPENCODE_SERVER_PASSWORD
+    if [ -n "${OPENCODE_SERVER_USERNAME:-}" ]; then
+        pass_env="$pass_env,OPENCODE_SERVER_USERNAME"
+    fi
+    set -- --pass-env "$pass_env" -p "$bind:$port:$port" \
+        run -- serve --hostname 0.0.0.0 --port "$port" "$@"
+else
+    set -- -p "$bind:$port:$port" \
+        run -- serve --hostname 0.0.0.0 --port "$port" "$@"
+fi
+
+exec "${ENCLAVE_BIN:-enclave}" --tool opencode "$@"

@@ -82,10 +82,11 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [rebase](commands/host/rebase) | host command | `enclave rebase [target]` — agent-assisted rebase onto a target branch (default `main`) |
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
+| [opencode-web](commands/host/opencode-web) | host command | `enclave opencode-web` — serve OpenCode's web UI from a session and publish its port, on loopback unless you say otherwise |
 
 ## Host commands
 
-Each host command here is a prompt plus a bit of argument handling, wrapped by
+Most host commands here are a prompt plus a bit of argument handling, wrapped by
 [`commands/host/lib/enclave-cmd.sh`](commands/host/lib/enclave-cmd.sh). The
 library gives every command a `-h` that reports its resolved configuration
 instead of starting a session, lets it pin a tool and that tool's flags, and
@@ -126,6 +127,33 @@ updating this repository leaves those settings alone. Per-command entries
 override anything a command declares for itself, which is what makes them
 survive a reinstall: retune the local file rather than the installed command.
 Set `ENCLAVE_CMD_CONFIG` to keep the file somewhere else.
+
+### opencode-web
+
+`opencode-web` is the exception: it starts a server rather than a prompt, so it
+skips the library — which ends its invocation with a prompt and cannot express
+a published port, a forwarded environment, or a tool subcommand — and does its
+own argument handling instead. It picks the first free port at or above 3000,
+uses it on both sides so the URL OpenCode prints is the one that works here,
+and publishes it:
+
+```bash
+enclave opencode-web -h                      # usage, and what the port exposes
+enclave opencode-web                         # 127.0.0.1 only
+enclave opencode-web --bind 0.0.0.0          # every interface; needs a password
+enclave opencode-web -- --print-logs         # flags for `opencode serve`
+```
+
+Whoever reaches that port drives an agent that can write to your project, over
+plain HTTP. Off loopback the command therefore refuses to start without
+`OPENCODE_SERVER_PASSWORD` (forwarded with `--pass-env`, along with
+`OPENCODE_SERVER_USERNAME` when set); on loopback it warns instead, since every
+account on the host can still reach it. Enclave installs `opencode-ai`
+unpinned, so before binding anywhere reachable, confirm that the version in
+your image enforces that password: `enclave --tool opencode run -- serve
+--help`. Note also that enclave's env store keeps `--pass-env` values on the
+host and reuses them when the variable is unset later, so a rotated password
+outlives the session that set it.
 
 ## Updating
 
@@ -255,6 +283,14 @@ Leave the tool out, as the commands here do: a prompt that only works on one
 tool is a prompt to fix, and a model preference belongs in the local config,
 where it is the reader's to choose. `enclave_cmd_tool` and `enclave_cmd_args`
 exist for a command that truly cannot work otherwise, and are then set together.
+
+A command that starts something other than an agent session skips the library
+and handles its own arguments, as [`opencode-web`](commands/host/opencode-web)
+does. It still owes the reader the two things the library would have given it:
+a `-h` that explains the command instead of reaching the tool, since enclave
+passes every argument through verbatim, and `"${ENCLAVE_BIN:-enclave}"` rather
+than a bare `$ENCLAVE_BIN`, which enclave leaves empty if it cannot resolve its
+own path and does not set at all from a checkout.
 
 Because the library resolves itself from `$0`, an in-tree command runs straight
 from a checkout:

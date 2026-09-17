@@ -83,6 +83,7 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
 | [opencode-web](commands/host/opencode-web) | host command | `enclave opencode-web` — serve OpenCode's web UI from a session and publish its port, on loopback unless you say otherwise |
+| [update-all](commands/host/update-all) | host command | `enclave update-all` — run `enclave update` once per installed tool, so every tool image gets the latest agent CLI |
 
 ## Host commands
 
@@ -130,12 +131,12 @@ Set `ENCLAVE_CMD_CONFIG` to keep the file somewhere else.
 
 ### opencode-web
 
-`opencode-web` is the exception: it starts a server rather than a prompt, so it
-skips the library — which ends its invocation with a prompt and cannot express
-a published port, a forwarded environment, or a tool subcommand — and does its
-own argument handling instead. It picks the first free port at or above 3000,
-uses it on both sides so the URL OpenCode prints is the one that works here,
-and publishes it:
+`opencode-web` is one of the two commands that drive no agent: it starts a
+server rather than a prompt, so it skips the library — which ends its
+invocation with a prompt and cannot express a published port, a forwarded
+environment, or a tool subcommand — and does its own argument handling
+instead. It picks the first free port at or above 3000, uses it on both sides
+so the URL OpenCode prints is the one that works here, and publishes it:
 
 ```bash
 enclave opencode-web -h                      # usage, and what the port exposes
@@ -154,6 +155,36 @@ your image enforces that password: `enclave --tool opencode run -- serve
 --help`. Note also that enclave's env store keeps `--pass-env` values on the
 host and reuses them when the variable is unset later, so a rotated password
 outlives the session that set it.
+
+### update-all
+
+`update-all` is the other one: it drives the host's `enclave update` in a loop
+rather than an agent, so it too handles its own arguments. Enclave's own
+`update` takes a tool list but has no "all of them" — and no per-tool
+enablement either, since every installed profile is selectable with `--tool` —
+so the list is whatever `enclave tools list` reports:
+
+```bash
+enclave update-all -h                        # usage, and what it will build
+enclave update-all --dry-run                 # the invocations, without building
+enclave update-all --skip theia-next         # leave one out; repeatable
+enclave update-all -- --slim                 # build flags for each update
+```
+
+Each tool gets its own invocation, so one failure does not cost the others
+their refresh: the run ends with the tools that failed and a non-zero exit.
+Image names are per project and per feature set, so run it from the project
+whose images you want current and pass that project's build flags after `--`.
+
+The list is every installed tool, not every tool you have used, so a profile
+whose image was never built is built here from scratch — a first
+`update-all` can spend a multi-gigabyte build on a tool you have never run.
+`--skip` keeps those out, and `enclave update <tool>...` remains the way to
+name a few.
+
+It reads the tool list from `enclave tools list --json` when `python3` is on
+`PATH` and falls back to parsing the plain `enclave tools` listing otherwise;
+either way a failure to list is reported rather than treated as an empty set.
 
 ## Updating
 
@@ -205,8 +236,10 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │   └── host/
 │       ├── lib/        # shared helpers, sourced by the commands beside it
 │       ├── check-pr
+│       ├── opencode-web
 │       ├── rebase
-│       └── triage
+│       ├── triage
+│       └── update-all
 ├── features/           # kind: mixin — tooling available to all agents
 │   ├── diffity/
 │   ├── java/

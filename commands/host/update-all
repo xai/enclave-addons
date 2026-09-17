@@ -1,0 +1,174 @@
+#!/bin/sh
+#
+# Unlike the prompt commands here, this one is not a wrapper around
+# lib/enclave-cmd.sh: it drives the host's own `enclave update` instead of
+# starting an agent session, so it handles its own arguments -- including the
+# -h that enclave would otherwise pass through to a tool.
+
+set -eu
+
+dry_run=0
+skips=
+
+usage() {
+    cat <<EOF
+Usage: enclave update-all [--skip <tool>]... [--dry-run] [--] [<enclave update flags>]
+
+Run 'enclave update' once per installed tool, so every tool image is rebuilt
+with the latest agent CLI. Enclave has no per-tool enablement -- every
+installed profile is selectable with --tool -- so the list is whatever
+'enclave tools list' reports.
+
+Options:
+  --skip <tool>   leave one tool out; repeatable
+  -n, --dry-run   print the invocations instead of running them
+  -h, --help      this message
+
+Each tool gets its own invocation and a failure does not stop the others: the
+run ends with the tools that failed and a non-zero exit, so one broken image
+still lets the rest refresh.
+
+Image names are per project and per feature set, so this refreshes the images
+that this directory's configuration would use. Run it from the project whose
+images you want current, and pass that project's build flags through after --,
+as in 'enclave update-all -- --slim'.
+
+A tool whose image has never been built is built from scratch here, which for
+a tool you have never run means a full, possibly multi-gigabyte build. Keep
+those out with --skip, or name the ones you want directly:
+'enclave update codex claude'.
+
+Defined in: $0
+Enclave update flags: enclave update --help
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -n|--dry-run)
+            dry_run=1
+            shift
+            ;;
+        --skip)
+            if [ $# -lt 2 ]; then
+                printf '%s\n' '--skip requires a tool name.' >&2
+                exit 2
+            fi
+            skips="$skips $2"
+            shift 2
+            ;;
+        --skip=*)
+            skips="$skips ${1#--skip=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# enclave leaves ENCLAVE_BIN empty when it cannot resolve its own path, and
+# does not set it at all for an in-tree run of this script; :- covers both.
+enclave=${ENCLAVE_BIN:-enclave}
+
+# list_contains <word> <list> -- whether a whitespace-separated list holds a
+# word. Tool names match ^[a-z0-9][a-z0-9._-]*$, so splitting on whitespace is
+# safe for every list this command builds.
+list_contains() {
+    for list_contains_entry in $2; do
+        if [ "$list_contains_entry" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# list_tools -- the installed tool profiles, one per line, in listing order.
+#
+# 'tools list --json' is the documented machine-readable interface and carries
+# an explicit enabled flag, so it is the first choice; the plain listing is the
+# fallback for a host without python3, where every line is "<mark> <name>"
+# followed by optional provenance and selection markers.
+list_tools() {
+    if command -v python3 >/dev/null 2>&1; then
+        # Captured rather than piped straight in: a pipeline would report
+        # python3's success and turn a failed listing into an empty one.
+        tools_json=$("$enclave" tools list --json)
+        printf '%s' "$tools_json" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+for ext in data.get("extensions", []):
+    name = str(ext.get("name", "")).strip()
+    if name and ext.get("enabled", True):
+        print(name)
+'
+        return
+    fi
+
+    "$enclave" tools | awk '$1 == "✓" { print $2 }'
+}
+
+tools=$(list_tools)
+if [ -z "$tools" ]; then
+    printf '%s\n' 'No installed tools to update.' >&2
+    exit 1
+fi
+
+selected=
+skipped=
+for tool in $tools; do
+    if list_contains "$tool" "$skips"; then
+        printf 'Skipping %s.\n' "$tool"
+        skipped="$skipped $tool"
+        continue
+    fi
+    selected="$selected $tool"
+done
+
+# A --skip that matched nothing is a typo, and letting it pass costs exactly
+# the build the user asked to avoid, so it fails before anything is built.
+for skip in $skips; do
+    if ! list_contains "$skip" "$skipped"; then
+        printf 'No installed tool is named %s.\n' "$skip" >&2
+        exit 2
+    fi
+done
+
+if [ -z "$selected" ]; then
+    printf '%s\n' 'Every installed tool was skipped; nothing to update.' >&2
+    exit 1
+fi
+
+printf 'Updating:%s\n' "$selected"
+
+failed=
+for tool in $selected; do
+    printf '\n=== enclave update %s ===\n' "$tool"
+    if [ "$dry_run" -eq 1 ]; then
+        continue
+    fi
+    if ! "$enclave" update "$tool" "$@"; then
+        failed="$failed $tool"
+    fi
+done
+
+if [ -n "$failed" ]; then
+    printf '\nFailed to update:%s\n' "$failed" >&2
+    exit 1
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+    printf '\nDry run: nothing was built.\n'
+else
+    printf '\nUpdated:%s\n' "$selected"
+fi

@@ -73,6 +73,7 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [neovim](features/neovim/) | feature | Neovim editor with lazy.nvim and sensible defaults |
 | [vimwiki](features/vimwiki/) | feature | Vimwiki plugin on top of the neovim feature; dormant outside unlocked vimwiki sessions. Per-run feature: select with `--features +neovim,+vimwiki`, never enabled globally |
 | [neovim (tool)](tools/neovim/) | tool | `enclave --tool neovim` — Neovim as the session tool, for editor-only sandboxes |
+| [antigravity](tools/antigravity/) | tool | `enclave --tool antigravity` — Google's Antigravity CLI (`agy`), installed from the upstream release, with its telemetry opted out and its self-updater cut off |
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [diffity](features/diffity/) | feature | GitHub-style diff viewer and code review UI, with `/diffity-*` skills for every skill-capable Enclave tool |
@@ -250,6 +251,7 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │   ├── texlive-upstream/
 │   └── vimwiki/
 └── tools/              # kind: sandbox — runnable session tools
+    ├── antigravity/
     └── neovim/
 ```
 

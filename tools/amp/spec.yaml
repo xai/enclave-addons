@@ -1,0 +1,67 @@
+schemaVersion: "1"
+kind: sandbox
+name: amp
+displayName: Amp
+description: Sourcegraph's Amp coding agent CLI
+defaultIncluded: false
+
+sandbox:
+  entrypoint: { run: [amp] }
+  # amp spreads its state over three XDG directories: ~/.config/amp holds
+  # settings.json and the global skills directory, ~/.cache/amp holds the logs,
+  # and ~/.local/share/amp holds secrets.json (the login token) and
+  # device-id.json. Only one directory can be the config store, so the store is
+  # the one carrying the credential; entrypoint.d/setup.sh moves the settings
+  # file in after it with AMP_SETTINGS_FILE.
+  configDir: .local/share/amp
+  # Enclave requires skillsDir below configDir, so managed skills are composed
+  # into the store rather than into ~/.config/amp/skills, where amp looks for
+  # global skills. entrypoint.d/setup.sh links the latter at the former.
+  skillsDir: .local/share/amp/skills
+  settingsFile: amp-settings.json
+  settingsTarget: .local/share/amp/settings.json
+  # amp has no permission-bypass flag: what used to be --dangerously-allow-all
+  # is the amp.dangerouslyAllowAll setting, which entrypoint.d/setup.sh writes
+  # to match ENCLAVE_YOLO. yoloFlag is therefore empty rather than missing by
+  # oversight.
+  yoloEnabled: true
+  continueArgs: [last]
+  resumeArgs: [threads, continue]
+  # The CLI bundles SQLite and keeps local thread state beside the credential.
+  qemuStoreCacheMmap: true
+  # No passthroughPaths: host config passthrough resolves below hostConfigDir,
+  # and the files worth passing through (settings.json, skills/) live in
+  # ~/.config/amp on the host, outside it.
+  hostConfigDir: .local/share/amp
+  hostCredentialsFile: secrets.json
+
+environment:
+  variables:
+    # Terminal access from ampcode.com for a thread opened on another client.
+    # Pinned off: a session's shell is the thing the sandbox exists to contain,
+    # and the CLI does not document which way this defaults.
+    AMP_REMOTE_CONTROL_TERMINAL: "0"
+
+network:
+  deniedDomains:
+    # Where `amp update` fetches binaries. The allowlist has to resolve
+    # ampcode.com for the agent backend and dnsmasq matches subdomains, so this
+    # host is denied explicitly instead of left out: deny out-ranks allow, and
+    # the binary the image was built with stays the binary that runs.
+    - static.ampcode.com
+  serviceDomains:
+    ampcode.com: amp-api-key
+  serviceAuth:
+    amp-api-key: { headerName: authorization, valueFormat: "Bearer %s" }
+
+credentials:
+  sources:
+    amp-api-key: { env: [AMP_API_KEY] }
+
+providers:
+  - name: amp
+    credentials: [amp-api-key]
+    authFiles: [secrets.json]
+    authSession:
+      checks:
+        - { file: secrets.json, type: file_exists }

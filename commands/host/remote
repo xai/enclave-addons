@@ -1,0 +1,693 @@
+#!/bin/sh
+#
+# Unlike the prompt commands here, this one is not a wrapper around
+# lib/enclave-cmd.sh: it drives an enclave binary on another host rather than
+# starting a local agent session, so it handles its own arguments and transport.
+
+set -eu
+
+usage() {
+    cat <<EOF
+Usage: enclave remote [<host>] [--sync=git|none] [--] [<enclave arguments>...]
+       enclave remote pull [<host>]
+
+Run enclave in this project's checkout on an SSH host. Session-starting
+commands push the current committed branch first; use --sync=none to run the
+remote checkout as-is. The forwarded -- is preserved, so it still separates
+Enclave options from tool arguments.
+
+Host resolution (highest priority):
+  1. positional <host>
+  2. ENCLAVE_REMOTE_HOST
+  3. git config enclave.remote.host
+
+A sole positional argument is the host. With further arguments, a positional
+host is recognized only when followed by a flag or a known Enclave verb. Prefer
+ENCLAVE_REMOTE_HOST in scripts when that rule is ambiguous. SSH aliases, users,
+ports, identities, and jump hosts come from ~/.ssh/config. One temporary shared
+SSH connection is used for every remote command and Git transfer in a run.
+
+Options:
+  --sync=git       push a clean branch before starting/resuming (default)
+  --sync=none      do not inspect or push the local checkout
+  -h, --help       this message; never contacts a host
+
+Remote directory configuration:
+  git config enclave.remote.dir   exact directory (highest priority)
+  git config enclave.remote.root  root for generated project directories
+  ENCLAVE_REMOTE_ROOT             fallback custom root
+  default root                    ~/.local/share/enclave/remote-workspaces
+
+Environment:
+  ENCLAVE_REMOTE_HOST             default SSH host
+  ENCLAVE_REMOTE_ROOT             fallback remote checkout root
+  ENCLAVE_REMOTE_DRY_RUN=1        print the final SSH command; no remote contact
+
+'pull' fetches the remote branch into FETCH_HEAD without merging or checking
+it out. If Enclave is missing remotely, the matching rolling-release binary is
+checksum-verified and installed to ~/.local/bin/enclave. This bootstrap needs
+curl locally and sha256sum (or shasum) remotely. No credentials are forwarded:
+authenticate Enclave on the remote host.
+
+Defined in: $0
+EOF
+}
+
+die() {
+    printf 'remote: %s\n' "$1" >&2
+    exit "${2:-2}"
+}
+
+# shell_quote writes one shell word. The closing quote keeps command
+# substitution from stripping newlines that are part of the value.
+shell_quote() {
+    shell_quote_value=$1
+    printf "'"
+    while :; do
+        case "$shell_quote_value" in
+            *"'"*)
+                shell_quote_prefix=${shell_quote_value%%"'"*}
+                printf "%s'\\''" "$shell_quote_prefix"
+                shell_quote_value=${shell_quote_value#*"'"}
+                ;;
+            *)
+                printf "%s'" "$shell_quote_value"
+                break
+                ;;
+        esac
+    done
+}
+
+is_enclave_verb() {
+    case "$1" in
+        attach|auth|cleanup|completion|config|continue|devcontainer|exec|extension|\
+        features|help|img|info|network|ps|resume|review-target|run|shell|ssh-init|\
+        ssh|status|stop|theia|theia-next|tools|update|validate-extensions|version)
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+could_follow_host() {
+    case "$1" in
+        -*) return 0 ;;
+    esac
+    is_enclave_verb "$1"
+}
+
+git_config() {
+    git -C "$project_root" config --get "$1" 2>/dev/null || :
+}
+
+sanitize_branch() {
+    # This mirrors Enclave session names: lowercase, runs of non-alphanumerics
+    # collapsed to '-', no edge separators, and at most 32 characters.
+    printf '%s' "$1" |
+        LC_ALL=C sed \
+            -e 'y/ABCDEFGHIJKLMNOPQRSTUVWXYZ/abcdefghijklmnopqrstuvwxyz/' \
+            -e 's/[^a-z0-9][^a-z0-9]*/-/g' \
+            -e 's/^-//' -e 's/-$//' |
+        cut -c 1-32 |
+        sed 's/-$//'
+}
+
+# $HOME in this function is deliberately emitted for the remote shell.
+# shellcheck disable=SC2016
+remote_path_expression() {
+    case "$1" in
+        \~) printf '%s' '$HOME' ;;
+        \~/*)
+            remote_path_suffix=${1#\~/}
+            printf '$HOME/%s' "$(shell_quote "$remote_path_suffix")"
+            ;;
+        *) shell_quote "$1" ;;
+    esac
+}
+
+ssh_connection_error() {
+    printf "remote: SSH connection to '%s' failed.\n" "$host" >&2
+}
+
+ssh_control_dir=
+ssh_control_path=
+git_ssh_command=
+
+# Invoked indirectly by EXIT and signal traps.
+# shellcheck disable=SC2317
+cleanup_ssh_control() {
+    [ -n "$ssh_control_dir" ] || return 0
+    ssh -S "$ssh_control_path" -O exit -- "$host" >/dev/null 2>&1 || :
+    rm -rf "$ssh_control_dir"
+    ssh_control_dir=
+}
+
+setup_ssh_control() {
+    ssh_control_dir=$(mktemp -d "${TMPDIR:-/tmp}/enclave-remote.XXXXXX") ||
+        die 'could not create a temporary SSH control directory.' 1
+    ssh_control_path=$ssh_control_dir/socket
+    git_ssh_command="ssh -o ControlMaster=auto -o ControlPersist=60 -o ControlPath=$(shell_quote "$ssh_control_path")"
+    trap cleanup_ssh_control EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+remote_ssh() {
+    ssh -o ControlMaster=auto -o ControlPersist=60 \
+        -o "ControlPath=$ssh_control_path" "$@"
+}
+
+run_remote_setup() {
+    run_remote_setup_command="sh -c $(shell_quote "$1")"
+    if remote_ssh -T -- "$host" "$run_remote_setup_command"; then
+        return 0
+    else
+        run_remote_setup_status=$?
+    fi
+    if [ "$run_remote_setup_status" -eq 255 ]; then
+        ssh_connection_error
+    fi
+    return "$run_remote_setup_status"
+}
+
+remote_preflight() {
+    # This program is interpreted by the remote shell, not the local one.
+    # shellcheck disable=SC2016
+    preflight_payload='enclave_bin=$(command -v enclave 2>/dev/null || :)
+if [ -z "$enclave_bin" ] && [ -x "$HOME/.local/bin/enclave" ]; then
+    enclave_bin=$HOME/.local/bin/enclave
+fi
+[ -n "$enclave_bin" ] || exit 127
+printf "%s\n" "$enclave_bin"
+"$enclave_bin" version --json'
+    preflight_command="sh -c $(shell_quote "$preflight_payload")"
+    if preflight_output=$(remote_ssh -T -- "$host" "$preflight_command"); then
+        remote_enclave_path=$(printf '%s\n' "$preflight_output" | sed -n '1p')
+        remote_version=$(printf '%s\n' "$preflight_output" | sed '1d')
+        if [ -z "$remote_enclave_path" ] || [ -z "$remote_version" ]; then
+            printf "remote: invalid response from 'enclave version --json' on '%s'.\n" "$host" >&2
+            return 1
+        fi
+        return 0
+    else
+        preflight_status=$?
+        return "$preflight_status"
+    fi
+}
+
+bootstrap_remote_enclave() {
+    if ! command -v curl >/dev/null 2>&1; then
+        printf '%s\n' 'remote: installing Enclave remotely requires curl on the local host.' >&2
+        return 1
+    fi
+
+    platform_payload='uname -s; uname -m'
+    platform_command="sh -c $(shell_quote "$platform_payload")"
+    if platform_output=$(remote_ssh -T -- "$host" "$platform_command"); then
+        remote_os=$(printf '%s\n' "$platform_output" | sed -n '1p')
+        remote_arch=$(printf '%s\n' "$platform_output" | sed -n '2p')
+    else
+        platform_status=$?
+        if [ "$platform_status" -eq 255 ]; then
+            ssh_connection_error
+        fi
+        return "$platform_status"
+    fi
+
+    case "$remote_os:$remote_arch" in
+        Linux:x86_64|Linux:amd64) release_asset='enclave-linux-amd64' ;;
+        Linux:aarch64|Linux:arm64) release_asset='enclave-linux-arm64' ;;
+        Darwin:x86_64|Darwin:amd64) release_asset='enclave-darwin-amd64' ;;
+        Darwin:arm64|Darwin:aarch64) release_asset='enclave-darwin-arm64' ;;
+        *)
+            printf "remote: no Enclave release binary supports remote platform %s/%s.\n" \
+                "$remote_os" "$remote_arch" >&2
+            return 1
+            ;;
+    esac
+
+    release_base=https://github.com/eclipse-enclave/enclave/releases/download/rolling
+    if ! checksums=$(curl -fsSL "$release_base/checksums.txt"); then
+        printf '%s\n' 'remote: could not download Enclave release checksums.' >&2
+        return 1
+    fi
+    expected_checksum=$(printf '%s\n' "$checksums" |
+        sed -n "s/^\\([0-9a-fA-F]*\\)[[:space:]][[:space:]]*$release_asset$/\\1/p")
+    case "$expected_checksum" in
+        ''|*[!0-9a-fA-F]*)
+            printf "remote: checksums.txt has no valid entry for %s.\n" "$release_asset" >&2
+            return 1
+            ;;
+    esac
+    if [ "${#expected_checksum}" -ne 64 ]; then
+        printf "remote: checksums.txt has an invalid SHA-256 for %s.\n" "$release_asset" >&2
+        return 1
+    fi
+
+    quoted_expected_checksum=$(shell_quote "$expected_checksum")
+    # This program is interpreted by the remote shell, not the local one.
+    # shellcheck disable=SC2016
+    install_payload='umask 077
+install_dir=$HOME/.local/bin
+mkdir -p "$install_dir" || exit 1
+tmp=$install_dir/.enclave.remote.$$
+if ! cat > "$tmp"; then rm -f "$tmp"; exit 1; fi
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp")
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp")
+else
+    echo "remote: verifying Enclave requires sha256sum or shasum." >&2
+    rm -f "$tmp"
+    exit 1
+fi
+actual=${actual%% *}
+expected='"$quoted_expected_checksum"'
+if [ "$actual" != "$expected" ]; then
+    echo "remote: downloaded Enclave binary failed SHA-256 verification." >&2
+    rm -f "$tmp"
+    exit 1
+fi
+chmod 755 "$tmp" && mv -f "$tmp" "$install_dir/enclave"'
+    install_command="sh -c $(shell_quote "$install_payload")"
+    printf "Installing %s on %s as ~/.local/bin/enclave.\n" "$release_asset" "$host" >&2
+    if curl -fsSL "$release_base/$release_asset" |
+        remote_ssh -T -- "$host" "$install_command"; then
+        return 0
+    else
+        install_status=$?
+    fi
+    if [ "$install_status" -eq 255 ]; then
+        ssh_connection_error
+    else
+        printf "remote: could not install Enclave on '%s'.\n" "$host" >&2
+    fi
+    return "$install_status"
+}
+
+append_port() {
+    if [ -z "$published_ports" ]; then
+        published_ports=$1
+    else
+        published_ports="$published_ports
+$1"
+    fi
+}
+
+published_host_port() {
+    published_port_spec=${1%/tcp}
+    published_port_spec=${published_port_spec%/udp}
+    case "$published_port_spec" in
+        *:*)
+            published_port_before_container=${published_port_spec%:*}
+            printf '%s' "${published_port_before_container##*:}"
+            ;;
+        *) printf '%s' "$published_port_spec" ;;
+    esac
+}
+
+print_tunnel_hints() {
+    [ -n "$published_ports" ] || return 0
+    old_ifs=$IFS
+    IFS='
+'
+    for published_port_spec in $published_ports; do
+        published_port=$(published_host_port "$published_port_spec")
+        case "$published_port" in
+            0)
+                printf '%s\n' \
+                    'remote: -p requested an automatic host port; find it with' \
+                    "  enclave remote $(shell_quote "$host") ps --json" >&2
+                ;;
+            ''|*[!0-9]*)
+                printf "remote: cannot derive an SSH tunnel from -p %s; inspect 'enclave remote %s ps --json'.\n" \
+                    "$published_port_spec" "$host" >&2
+                ;;
+            *)
+                printf 'Remote port %s: ssh -L %s:127.0.0.1:%s %s\n' \
+                    "$published_port" "$published_port" "$published_port" "$host" >&2
+                ;;
+        esac
+    done
+    IFS=$old_ifs
+}
+
+if [ $# -gt 0 ]; then
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+fi
+
+project_root=${ENCLAVE_PROJECT_ROOT:-$PWD}
+pull=0
+positional_host=
+sync=git
+
+if [ $# -gt 0 ] && [ "$1" = pull ]; then
+    pull=1
+    shift
+    if [ $# -gt 0 ]; then
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*) die "unknown pull option '$1'" ;;
+            *) positional_host=$1; shift ;;
+        esac
+    fi
+    [ $# -eq 0 ] || die 'pull accepts at most one host.'
+elif [ $# -gt 0 ]; then
+    case "$1" in
+        -*) ;;
+        *)
+            if [ $# -eq 1 ] || could_follow_host "$2"; then
+                positional_host=$1
+                shift
+            fi
+            ;;
+    esac
+fi
+
+if [ "$pull" -eq 0 ]; then
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sync=git) sync=git; shift ;;
+            --sync=none) sync=none; shift ;;
+            --sync=*) die "unknown sync mode '${1#--sync=}'; use git or none." ;;
+            --sync)
+                [ $# -gt 1 ] || die '--sync requires git or none.'
+                case "$2" in
+                    git|none) sync=$2 ;;
+                    *) die "unknown sync mode '$2'; use git or none." ;;
+                esac
+                shift 2
+                ;;
+            *) break ;;
+        esac
+    done
+fi
+
+configured_host=$(git_config enclave.remote.host)
+if [ -n "$positional_host" ]; then
+    host=$positional_host
+elif [ -n "${ENCLAVE_REMOTE_HOST:-}" ]; then
+    host=$ENCLAVE_REMOTE_HOST
+elif [ -n "$configured_host" ]; then
+    host=$configured_host
+else
+    die 'no host configured; pass <host>, set ENCLAVE_REMOTE_HOST, or run git config enclave.remote.host <host>.'
+fi
+
+git_top=$(git -C "$project_root" rev-parse --show-toplevel 2>/dev/null || :)
+configured_dir=$(git_config enclave.remote.dir)
+branch=
+branch_dir=
+branch_hash=
+managed_default_root=0
+
+resolve_branch() {
+    [ -n "$git_top" ] || die 'this operation requires a git work tree.'
+    branch=$(git -C "$git_top" branch --show-current 2>/dev/null || :)
+    [ -n "$branch" ] || die 'the local checkout has a detached HEAD; check out a branch first.'
+    branch_dir=$(sanitize_branch "$branch")
+    [ -n "$branch_dir" ] || die "branch '$branch' has no usable remote directory name."
+    branch_hash=$(printf '%s' "$branch" | git -C "$git_top" hash-object --stdin)
+    branch_dir=$branch_dir-$branch_hash
+}
+
+if [ -n "$configured_dir" ]; then
+    remote_dir=$configured_dir
+else
+    [ -n "$git_top" ] || die 'not a git work tree; set git config enclave.remote.dir.'
+    resolve_branch
+    configured_root=$(git_config enclave.remote.root)
+    if [ -n "$configured_root" ]; then
+        remote_root=$configured_root
+    elif [ -n "${ENCLAVE_REMOTE_ROOT:-}" ]; then
+        remote_root=$ENCLAVE_REMOTE_ROOT
+    else
+        # Kept for expansion by the remote shell and Git's SSH path handling.
+        # shellcheck disable=SC2088
+        remote_root='~/.local/share/enclave/remote-workspaces'
+        managed_default_root=1
+    fi
+    repo_name=$(basename "$git_top")
+    repo_slug=$(sanitize_branch "$repo_name")
+    [ -n "$repo_slug" ] || repo_slug=project
+    repository_identity=$(git -C "$git_top" config --get remote.origin.url 2>/dev/null || :)
+    [ -n "$repository_identity" ] || repository_identity=$git_top
+    project_hash=$(printf '%s' "$repository_identity" |
+        git -C "$git_top" hash-object --stdin)
+    remote_dir=${remote_root%/}/$repo_slug-$project_hash/$branch_dir
+fi
+remote_dir_expression=$(remote_path_expression "$remote_dir")
+if [ "$managed_default_root" -eq 1 ]; then
+    remote_root_expression=$(remote_path_expression "$remote_root")
+    remote_root_marker=$remote_root_expression/.enclave-remote-root
+fi
+case "$remote_dir" in
+    \~) git_remote_dir=. ;;
+    \~/*) git_remote_dir=${remote_dir#\~/} ;;
+    *) git_remote_dir=$remote_dir ;;
+esac
+
+if [ "$pull" -eq 1 ]; then
+    resolve_branch
+    setup_ssh_control
+    if [ "$managed_default_root" -eq 1 ]; then
+        marker_check="test -f $remote_root_marker"
+        if ! run_remote_setup "$marker_check"; then
+            die "the default remote workspace root is absent or not owned by enclave remote: $remote_root" 1
+        fi
+    fi
+    if GIT_SSH_COMMAND=$git_ssh_command \
+        git -C "$git_top" fetch -- "$host:$git_remote_dir" "$branch"; then
+        fetched_commit=$(git -C "$git_top" rev-parse FETCH_HEAD)
+        printf 'Fetched %s into FETCH_HEAD (%s).\n' "$branch" "$fetched_commit"
+        exit 0
+    else
+        pull_status=$?
+    fi
+    exit "$pull_status"
+fi
+
+# Inspect only Enclave options, stopping at the forwarded --. Besides enforcing
+# local-only guardrails, this finds the explicit verb that controls git sync.
+verb=
+scan_expect=
+auth_seen=0
+auth_import=0
+published_ports=
+for scan_arg in "$@"; do
+    if [ -n "$scan_expect" ]; then
+        case "$scan_expect" in
+            tool)
+                case "$scan_arg" in
+                    theia|theia-next) die "--tool $scan_arg cannot attach its host IDE across SSH." ;;
+                esac
+                ;;
+            port) append_port "$scan_arg" ;;
+        esac
+        scan_expect=
+        continue
+    fi
+
+    case "$scan_arg" in
+        --) break ;;
+        --tool) scan_expect=tool; continue ;;
+        --tool=*)
+            scan_tool=${scan_arg#--tool=}
+            case "$scan_tool" in
+                theia|theia-next) die "--tool $scan_tool cannot attach its host IDE across SSH." ;;
+            esac
+            continue
+            ;;
+        -p) scan_expect=port; continue ;;
+        -p=*) append_port "${scan_arg#-p=}"; continue ;;
+        --bridge-port|--bridge-port=*)
+            die '--bridge-port is inverted across the SSH hop and is not supported.'
+            ;;
+        --add-dir|--add-dir=*|--add-readonly-dir|--add-readonly-dir=*)
+            printf 'remote: warning: additional directory arguments name paths on the remote host.\n' >&2
+            case "$scan_arg" in
+                *=*) ;;
+                *) scan_expect=ignore ;;
+            esac
+            continue
+            ;;
+        --allow-domain|--auth-name|--auth-scope|--backend|--base-image|--build-gid|\
+        --build-uid|--buildx-cache-dir|--buildx-cache-from|--buildx-cache-to|\
+        --cache-from|--features|--host-config|--image-name|--name|--network-log|\
+        --pass-env|--progress|--project-mount|--secrets-scope|--skills-validation|\
+        --tool-settings|--worktree-metadata)
+            scan_expect=ignore
+            continue
+            ;;
+        --*=*|-*) continue ;;
+    esac
+
+    if [ -z "$verb" ] && is_enclave_verb "$scan_arg"; then
+        verb=$scan_arg
+        [ "$verb" = auth ] && auth_seen=1
+        continue
+    fi
+    if [ "$auth_seen" -eq 1 ] && [ "$scan_arg" = import ]; then
+        auth_import=1
+        auth_seen=0
+    fi
+done
+
+case "$verb" in
+    ''|run|shell|continue|resume) needs_sync=1 ;;
+    *) needs_sync=0 ;;
+esac
+
+dry_run=${ENCLAVE_REMOTE_DRY_RUN:-0}
+if [ "$dry_run" != 1 ] && [ "$needs_sync" -eq 1 ] && [ "$sync" = git ]; then
+    resolve_branch
+    dirty=$(git -C "$git_top" status --porcelain)
+    if [ -n "$dirty" ]; then
+        die 'the local checkout is dirty; commit the changes or pass --sync=none.'
+    fi
+fi
+
+if [ "$auth_import" -eq 1 ]; then
+    # Backticks here are prose delimiters, not command substitutions.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        'remote: auth import reads files on the remote host.' \
+        'Export locally with `enclave auth export --tool <tool>`, copy the files securely,' >&2
+    # shellcheck disable=SC2016
+    printf 'then run `enclave remote %s auth import --tool <tool>`.\n' \
+        "$(shell_quote "$host")" >&2
+fi
+
+# env is the only portable interface for enumerating exported variables. Env
+# values containing newlines are unusual; ordinary values (including spaces,
+# quotes, dollars, and backticks) are quoted before entering the remote shell.
+forwarded_env=$(
+    env | while IFS= read -r env_entry; do
+        env_name=${env_entry%%=*}
+        env_value=${env_entry#*=}
+        case "$env_name" in
+            ENCLAVE_REMOTE_*|ENCLAVE_BIN|ENCLAVE_PROJECT_ROOT|ENCLAVE_CONFIG_DIR) continue ;;
+            ENCLAVE_*) printf ' %s=%s' "$env_name" "$(shell_quote "$env_value")" ;;
+        esac
+    done
+)
+
+build_remote_command() {
+    remote_executable=$1
+    shift
+    remote_payload="cd $remote_dir_expression &&$forwarded_env $(shell_quote "$remote_executable")"
+    for remote_arg in "$@"; do
+        remote_payload="$remote_payload $(shell_quote "$remote_arg")"
+    done
+    remote_command="sh -c $(shell_quote "$remote_payload")"
+}
+
+build_remote_command enclave "$@"
+
+if [ -t 0 ] && [ -t 1 ]; then
+    tty_flag=-t
+else
+    tty_flag=-T
+fi
+
+if [ "$dry_run" = 1 ]; then
+    printf 'ssh %s -- %s %s\n' "$tty_flag" "$(shell_quote "$host")" "$(shell_quote "$remote_command")"
+    print_tunnel_hints
+    exit 0
+fi
+
+setup_ssh_control
+
+# A sync-eligible dirty tree was rejected above, before this first SSH call.
+if remote_preflight; then
+    :
+else
+    preflight_status=$?
+    case "$preflight_status" in
+        127)
+            if ! bootstrap_remote_enclave; then
+                exit 1
+            fi
+            if ! remote_preflight; then
+                printf "remote: installed Enclave on '%s' but could not run it.\n" "$host" >&2
+                exit 1
+            fi
+            ;;
+        255)
+            ssh_connection_error
+            exit 255
+            ;;
+        *)
+            printf "remote: could not run 'enclave version --json' on '%s'.\n" "$host" >&2
+            exit "$preflight_status"
+            ;;
+    esac
+fi
+
+build_remote_command "$remote_enclave_path" "$@"
+
+enclave=${ENCLAVE_BIN:-enclave}
+if local_version=$("$enclave" version --json 2>/dev/null); then
+    local_commit=$(printf '%s\n' "$local_version" |
+        sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    remote_commit=$(printf '%s\n' "$remote_version" |
+        sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -n "$local_commit" ] && [ -n "$remote_commit" ] && [ "$local_commit" != "$remote_commit" ]; then
+        printf "remote: warning: local Enclave commit %s differs from remote commit %s.\n" \
+            "$local_commit" "$remote_commit" >&2
+    fi
+fi
+
+if [ "$needs_sync" -eq 1 ] && [ "$sync" = git ]; then
+    remote_git_setup=
+    if [ "$managed_default_root" -eq 1 ]; then
+        ownership_error=$(shell_quote "remote: refusing unmarked workspace root $remote_root")
+        marker_text=$(shell_quote 'Owned by enclave remote; remove this whole directory only when its workspaces are no longer needed.')
+        remote_git_setup="if [ -e $remote_root_expression ] && [ ! -f $remote_root_marker ]; then printf '%s\\n' $ownership_error >&2; exit 73; fi
+mkdir -p $remote_root_expression || exit 1
+if [ ! -f $remote_root_marker ]; then printf '%s\\n' $marker_text > $remote_root_marker || exit 1; fi
+"
+    fi
+    creation_message=$(shell_quote "Creating remote checkout at $remote_dir.")
+    remote_git_setup="${remote_git_setup}if [ ! -d $remote_dir_expression/.git ]; then
+    printf '%s\\n' $creation_message >&2
+    git init -q $remote_dir_expression || exit 1
+    git -C $remote_dir_expression config receive.denyCurrentBranch updateInstead || exit 1
+fi"
+    run_remote_setup "$remote_git_setup" || exit $?
+
+    if GIT_SSH_COMMAND=$git_ssh_command \
+        git -C "$git_top" push -- "$host:$git_remote_dir" "HEAD:refs/heads/$branch"; then
+        :
+    else
+        push_status=$?
+        exit "$push_status"
+    fi
+
+    quoted_branch=$(shell_quote "$branch")
+    remote_checkout="current=\$(git -C $remote_dir_expression branch --show-current) && if [ \"\$current\" != $quoted_branch ]; then git -C $remote_dir_expression checkout -q $quoted_branch; fi"
+    run_remote_setup "$remote_checkout" || exit $?
+fi
+
+if remote_ssh "$tty_flag" -- "$host" "$remote_command"; then
+    remote_status=0
+else
+    remote_status=$?
+fi
+
+if [ "$remote_status" -eq 255 ]; then
+    ssh_connection_error
+fi
+if [ "$remote_status" -eq 0 ]; then
+    print_tunnel_hints
+fi
+exit "$remote_status"

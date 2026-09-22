@@ -85,6 +85,7 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [triage](commands/host/triage) | host command | `enclave triage` — collect unaddressed feedback from the branch's GitHub PR and the latest `.reviews/` round(s), verify it, and fix the findings you select |
 | [check-pr](commands/host/check-pr) | host command | `enclave check-pr` — gather all feedback on the branch's GitHub PR, verify it against the code, then ask whether to review the diff, fix the open findings, or stop |
 | [opencode-web](commands/host/opencode-web) | host command | `enclave opencode-web` — serve OpenCode's web UI from a session and publish its port, on loopback unless you say otherwise |
+| [remote](commands/host/remote) | host command | `enclave remote [host] …` — run Enclave in a remote checkout over SSH, syncing the current committed branch when starting a session |
 | [update-all](commands/host/update-all) | host command | `enclave update-all` — run `enclave update` once per installed tool, so every tool image gets the latest agent CLI |
 
 ## Host commands
@@ -133,12 +134,12 @@ Set `ENCLAVE_CMD_CONFIG` to keep the file somewhere else.
 
 ### opencode-web
 
-`opencode-web` is one of the two commands that drive no agent: it starts a
-server rather than a prompt, so it skips the library — which ends its
-invocation with a prompt and cannot express a published port, a forwarded
-environment, or a tool subcommand — and does its own argument handling
-instead. It picks the first free port at or above 3000, uses it on both sides
-so the URL OpenCode prints is the one that works here, and publishes it:
+`opencode-web` starts a server rather than a prompt, so it skips the library —
+which ends its invocation with a prompt and cannot express a published port, a
+forwarded environment, or a tool subcommand — and does its own argument
+handling instead. It picks the first free port at or above 3000, uses it on
+both sides so the URL OpenCode prints is the one that works here, and publishes
+it:
 
 ```bash
 enclave opencode-web -h                      # usage, and what the port exposes
@@ -158,13 +159,103 @@ your image enforces that password: `enclave --tool opencode run -- serve
 host and reuses them when the variable is unset later, so a rotated password
 outlives the session that set it.
 
+### remote
+
+`remote` drives an Enclave installation on an SSH host. It is useful for
+starting a named background session on an always-on machine, closing the local
+laptop, and attaching later:
+
+```bash
+./install.sh remote
+git config enclave.remote.host pi
+
+enclave remote --tool claude --background --name train -- -p "fix the flaky test"
+enclave remote ps --json
+enclave remote attach train
+enclave remote stop train
+```
+
+The host can instead be the only argument (`enclave remote pi`, which starts
+the default session), the first argument (`enclave remote pi ps --json`), or
+come from `ENCLAVE_REMOTE_HOST`. With further arguments, a positional host is
+recognized only when the next word is a flag or a known Enclave verb; use the
+environment variable in scripts when that would be ambiguous. The value is
+passed to `ssh` unchanged, so aliases, identities, ports, and jump hosts belong
+in `~/.ssh/config`. `remote` creates one temporary OpenSSH ControlMaster for its
+direct commands and Git transfers, then closes it on exit; password
+authentication therefore prompts once per invocation rather than once per SSH
+channel.
+
+Session-starting and resuming commands require a clean local tree and push
+`HEAD` without force to the same branch in the remote checkout. By default its
+directory is
+`~/.local/share/enclave/remote-workspaces/<repo>-<identity>/<branch>-<identity>`.
+The identities are full Git object hashes of the origin URL (falling back to
+the local checkout path) and unsanitized branch name, so repositories and
+branches that sanitize to the same display name remain separate. The default
+root carries `.enclave-remote-root`; if the directory already exists without
+that marker, `remote` refuses to use or modify it. This makes the entire root
+recognizably tool-owned and manually removable without claiming pre-existing
+user data. Set
+`enclave.remote.root` or `ENCLAVE_REMOTE_ROOT` to change the root, or
+`enclave.remote.dir` to set the whole path:
+
+```bash
+git config enclave.remote.root /srv/enclave
+git config enclave.remote.dir /srv/work/my-project  # exact path wins
+enclave remote --sync=none ps --json                # never inspect or push
+```
+
+Those explicit settings are user-owned and do not require the marker. To keep
+using a checkout created by an older `remote` release, point the clone at it,
+for example `git config enclave.remote.dir '~/enclave/my-project/main'`.
+Removing the managed workspace root removes only its Git checkouts; Enclave's
+remote credential and runtime stores remain in their normal config/state roots.
+
+`enclave remote pull [host]` fetches the remote branch into `FETCH_HEAD` and
+prints its commit, but deliberately does not merge or check anything out. This
+is the hand-back path for work committed remotely: inspect `FETCH_HEAD`, then
+merge or cherry-pick it yourself.
+
+If `enclave` is absent remotely, `remote` reads the host's `uname` OS and
+architecture, selects the rolling release for Linux or macOS on amd64 or arm64,
+downloads both it and `checksums.txt` over HTTPS on the local machine, and
+streams the binary over SSH. It verifies SHA-256 on the remote host before an
+atomic install to `~/.local/bin/enclave`, then invokes that explicit path even
+when `~/.local/bin` is not on the non-interactive SSH `PATH`. Bootstrapping
+requires local `curl` and remote `sha256sum` or `shasum`; unsupported platforms
+and failed verification leave no installed binary.
+
+The local and remote Enclave binaries are compared before each command and a
+different source commit warns. `ENCLAVE_*` controls are forwarded except
+`ENCLAVE_REMOTE_*` and the local runner's `ENCLAVE_BIN`,
+`ENCLAVE_PROJECT_ROOT`, and `ENCLAVE_CONFIG_DIR`. `--tool theia`,
+`--tool theia-next`, and `--bridge-port` cannot work across the extra hop and
+are refused; additional-directory flags name paths on the remote host. A
+published `-p 3000` prints the corresponding `ssh -L` command after a
+successful run. Use `ENCLAVE_REMOTE_DRY_RUN=1` to inspect the fully quoted SSH
+invocation without contacting the host or syncing.
+
+No credentials are forwarded. Enclave's credential, environment, state, and
+cache stores live on the remote host and stay there; authenticate Enclave on
+that host, and remember that SSH access to it is access to those stores. The
+command adds no egress to a sandbox: normal operation uses only the user's
+host-side SSH connection, while first-use bootstrapping also downloads the
+release from GitHub over HTTPS. It persists no state of its own beyond the Git
+checkout, the bootstrapped binary, and the remote Enclave state created by the
+commands it runs.
+
+When core Enclave provides `enclave ssh`, prefer that command for integrated
+configuration and documentation. `remote` remains useful with older Enclave
+releases and when a single inspectable shell script is preferable.
+
 ### update-all
 
-`update-all` is the other one: it drives the host's `enclave update` in a loop
-rather than an agent, so it too handles its own arguments. Enclave's own
-`update` takes a tool list but has no "all of them" — and no per-tool
-enablement either, since every installed profile is selectable with `--tool` —
-so the list is whatever `enclave tools list` reports:
+`update-all` drives the host's `enclave update` in a loop rather than an agent,
+so it too handles its own arguments. Enclave's own `update` takes a tool list
+but has no "all of them" — and no per-tool enablement either, since every
+installed profile is selectable with `--tool` — so the list is whatever
+`enclave tools list` reports:
 
 ```bash
 enclave update-all -h                        # usage, and what it will build
@@ -240,6 +331,7 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │       ├── check-pr
 │       ├── opencode-web
 │       ├── rebase
+│       ├── remote
 │       ├── triage
 │       └── update-all
 ├── features/           # kind: mixin — tooling available to all agents

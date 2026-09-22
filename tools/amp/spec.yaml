@@ -2,7 +2,7 @@ schemaVersion: "1"
 kind: sandbox
 name: amp
 displayName: Amp
-description: Sourcegraph's Amp coding agent CLI
+description: "Experimental: Sourcegraph's Amp coding agent CLI"
 defaultIncluded: false
 
 sandbox:
@@ -20,10 +20,10 @@ sandbox:
   skillsDir: .local/share/amp/skills
   settingsFile: amp-settings.json
   settingsTarget: .local/share/amp/settings.json
-  # amp has no permission-bypass flag: what used to be --dangerously-allow-all
-  # is the amp.dangerouslyAllowAll setting, which entrypoint.d/setup.sh writes
-  # to match ENCLAVE_YOLO. yoloFlag is therefore empty rather than missing by
-  # oversight.
+  # Amp still accepts --dangerously-allow-all for compatibility even though it
+  # omits the flag from --help. The entrypoint also keeps the persisted setting
+  # in sync, while a system policy plugin enforces prompts under --no-yolo.
+  yoloFlag: --dangerously-allow-all
   yoloEnabled: true
   continueArgs: [last]
   resumeArgs: [threads, continue]
@@ -38,8 +38,8 @@ sandbox:
 environment:
   variables:
     # Terminal access from ampcode.com for a thread opened on another client.
-    # Pinned off: a session's shell is the thing the sandbox exists to contain,
-    # and the CLI does not document which way this defaults.
+    # Amp documents 0 as disabled when no explicit CLI flag overrides it; a
+    # session's shell is the thing the sandbox exists to contain.
     AMP_REMOTE_CONTROL_TERMINAL: "0"
 
 network:

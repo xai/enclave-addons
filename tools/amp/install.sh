@@ -8,9 +8,11 @@
 # publishes a SHA-256 next to every build and takes a pinned version.
 set -euo pipefail
 
+EXTENSION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Build to install: "latest", or a pinned version like "0.0.1789660852-g000545".
 # Pinning here without pinning check-update.sh means the update probe keeps
-# reporting the newest upstream build and marking the image stale -- pin both
+# reporting the newest upstream build and marking the image stale; pin both
 # or neither.
 AMP_VERSION="${AMP_VERSION:-latest}"
 
@@ -44,7 +46,17 @@ curl -fsSL "$BASE/${version}/amp-linux-${ASSET_ARCH}.gz" -o "$tmp/amp.gz"
 curl -fsSL "$BASE/${version}/linux-${ASSET_ARCH}-amp.sha256" -o "$tmp/amp.sha256"
 gunzip -c "$tmp/amp.gz" > "$tmp/amp"
 
-echo "$(cat "$tmp/amp.sha256")  $tmp/amp" | sha256sum -c - > /dev/null
+checksum_line="$(< "$tmp/amp.sha256")"
+if [[ "$checksum_line" == *$'\n'* ]]; then
+    echo "Malformed Amp checksum: expected one record" >&2
+    exit 1
+fi
+checksum="${checksum_line%%[[:space:]]*}"
+if [[ ! "$checksum" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "Malformed Amp checksum: expected a SHA-256 digest" >&2
+    exit 1
+fi
+printf '%s  %s\n' "$checksum" "$tmp/amp" | sha256sum -c - > /dev/null
 
 mkdir -p "$HOME/.local/bin"
 install -m 0755 "$tmp/amp" "$HOME/.local/bin/amp"
@@ -63,3 +75,14 @@ fi
 # `amp --version` here could replace the build whose checksum was just verified.
 printf '{"amp.updates.mode":"disabled"}\n' > "$tmp/settings.json"
 echo "Amp CLI $(AMP_SETTINGS_FILE="$tmp/settings.json" amp --version) installed at $(command -v amp)"
+
+# Compile and execute one synthetic event against the no-yolo policy plugin.
+# plugins exec is local-only; the dummy key prevents an auth prompt if Amp's
+# command initialization changes before this smoke test runs.
+approval_plugin="$EXTENSION_DIR/plugins/enclave-approvals.ts"
+AMP_API_KEY=build-smoke-test \
+AMP_SETTINGS_FILE="$tmp/settings.json" \
+ENCLAVE_AMP_APPROVALS=1 \
+    amp plugins exec "$approval_plugin" tool.call --data \
+    '{"toolUseID":"install-smoke","tool":"apply_patch","input":{"patchText":"test"},"thread":{"id":"T-install-smoke"}}'
+echo "Amp no-yolo policy plugin loaded successfully"

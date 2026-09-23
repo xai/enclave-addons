@@ -7,6 +7,10 @@ not bundled with the main repository:
 [user commands](https://github.com/eclipse-enclave/enclave/blob/main/docs/ARCHITECTURE.md#key-concepts)
 (`enclave <name>` subcommands).
 
+For officially maintained extensions (including the `amp` and `antigravity`
+tools that used to live here), see
+[eclipse-enclave/enclave-extensions](https://github.com/eclipse-enclave/enclave-extensions).
+
 ## Installation
 
 Clone this repository and run the install script with the add-ons you want:
@@ -73,8 +77,6 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [neovim](features/neovim/) | feature | Neovim editor with lazy.nvim and sensible defaults |
 | [vimwiki](features/vimwiki/) | feature | Vimwiki plugin on top of the neovim feature; dormant outside unlocked vimwiki sessions. Per-run feature: select with `--features +neovim,+vimwiki`, never enabled globally |
 | [neovim (tool)](tools/neovim/) | tool | `enclave --tool neovim` — Neovim as the session tool, for editor-only sandboxes |
-| [antigravity](tools/antigravity/) | tool | Experimental: `enclave --tool antigravity` — Google's Antigravity CLI (`agy`), installed from the upstream GitHub release and checked against the manifest's SHA-512, with its telemetry opted out and its self-updater cut off. Requires the Enclave rolling release from 2026-09-21 or newer |
-| [amp](tools/amp/) | tool | Experimental: `enclave --tool amp` — Sourcegraph's Amp CLI, installed checksum-verified from upstream storage, with its self-updater blocked and its remote-control paths disabled by default |
 | [texlive-debian](features/texlive-debian/) | feature | TeX Live from Debian packages, sized for math/CS papers (beamer, TikZ, biblatex/biber, latexmk, IEEE/ACM classes) |
 | [texlive-upstream](features/texlive-upstream/) | feature | Current or pinned TeX Live release from TUG/CTAN via install-tl; wins over texlive-debian on `PATH` |
 | [diffity](features/diffity/) | feature | GitHub-style diff viewer and code review UI, with `/diffity-*` skills for every skill-capable Enclave tool |
@@ -344,8 +346,6 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │   ├── texlive-upstream/
 │   └── vimwiki/
 └── tools/              # kind: sandbox — runnable session tools
-    ├── amp/
-    ├── antigravity/
     └── neovim/
 ```
 

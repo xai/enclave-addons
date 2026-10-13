@@ -89,6 +89,7 @@ the file alone. A feature whose spec is marked `# x-install-mode: per-run` (only
 | [opencode-web](commands/host/opencode-web) | host command | `enclave opencode-web` — serve OpenCode's web UI from a session and publish its port, on loopback unless you say otherwise |
 | [remote](commands/host/remote) | host command | `enclave remote [host] …` — run Enclave in a remote checkout over SSH, syncing the current committed branch when starting a session |
 | [update-all](commands/host/update-all) | host command | `enclave update-all` — run `enclave update` once per installed tool, so every tool image gets the latest agent CLI |
+| [stats](commands/host/stats) | host command | `enclave stats` — how, when, and how much you use Enclave: sessions, active time, and tokens per tool, model, and project, an activity calendar, and what the gateway saw, read from local state without changing it |
 
 ## Host commands
 
@@ -281,6 +282,55 @@ It reads the tool list from `enclave tools list --json` when `python3` is on
 `PATH` and falls back to parsing the plain `enclave tools` listing otherwise;
 either way a failure to list is reported rather than treated as an empty set.
 
+### stats
+
+`stats` reports on your own use of Enclave from the state it keeps on this
+machine, and prints it in colour: sessions, active time, and tokens per tool,
+model, and project; an activity calendar and a weekday-by-hour heatmap;
+session lengths; habits such as parallel stores, agent memory, and subagents;
+and what the network gateway allowed and denied. It is a Python 3 script
+rather than a prompt, since it aggregates gigabytes of transcripts and logs,
+so unlike the other commands it needs `python3` on `PATH`:
+
+```bash
+enclave stats                                # everything, all time
+enclave stats --since 4w                     # the last four weeks
+enclave stats --tool claude,codex            # some tools only
+enclave stats --project enclave/             # projects whose path contains this
+enclave stats --disk                         # add disk usage; walks the cache
+```
+
+Sessions and tokens come from each tool's own transcripts in its config store:
+Claude Code and Codex JSONL, Pi session files, OpenCode's database, and Mistral
+Vibe's session metadata. That covers sessions with and without a network
+gateway. The gateway's network logs only exist for sessions that had one, so
+they feed the network section alone, plus a session count for a tool that
+leaves no transcripts (marked `†`). Antigravity conversations and Pi's durable
+sessions are counted without timing or tokens (marked `‡`). Ephemeral sessions
+delete their stores and are not counted at all.
+
+Session time is active time: a gap of more than 15 minutes (`--idle`) between
+a session's events is a break, so a session resumed the next day is not a day
+of work. Wall-clock time is the union of all sessions, and its ratio to session
+time is how many sessions you ran in parallel on average. Tokens are
+deduplicated by message id, because forks and subagents replay their parent's
+history, and are split into uncached input, cache reads, cache writes, and
+output as each tool records them.
+
+The scan is read-only. It opens a fixed set of transcript, log, and metadata
+files, follows no symlink below the state root, and never opens `env/`,
+`auth/`, `secrets/`, `tls/`, or a tool's credential files. A SQLite database
+whose write-ahead log holds data is copied into a private temporary directory
+and read there, so a running tool's database, WAL, and shared-memory index are
+never touched. OpenCode's database also keeps its account tokens; the copy
+lives in a `0700` directory under `$XDG_RUNTIME_DIR` and is removed before the
+command exits. The running-now tile comes from `enclave ps --json`. The
+fixture test checks that the state tree is unchanged afterwards:
+
+```bash
+sh commands/host/stats.test.sh
+```
+
 ## Updating
 
 Pull the latest changes, re-run the install script for your add-ons (it
@@ -334,6 +384,7 @@ The layout mirrors the enclave config root: `features/` and `tools/` map to
 │       ├── opencode-web
 │       ├── rebase
 │       ├── remote
+│       ├── stats
 │       ├── triage
 │       └── update-all
 ├── features/           # kind: mixin — tooling available to all agents

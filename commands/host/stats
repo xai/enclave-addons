@@ -1,0 +1,1889 @@
+#!/usr/bin/env python3
+#
+# Unlike the prompt commands here, this one is not a wrapper around
+# lib/enclave-cmd.sh: it reads Enclave's host-side state and prints a report
+# instead of starting a session, so it handles its own arguments -- including
+# the -h that enclave would otherwise pass through to a tool. It is Python
+# rather than sh because the report aggregates gigabytes of JSONL transcripts,
+# network logs, and SQLite databases, which a shell pipeline cannot do in
+# reasonable time.
+#
+# Read-only by construction. It opens an allowlist of known transcript, log,
+# and metadata files for reading and nothing else: env stores, auth stores,
+# secrets, TLS material, and the tools' credential files are never opened.
+# Below each root no symlink is followed, so a link planted in a store cannot
+# lead the scan elsewhere. SQLite databases are opened immutable, or -- when a
+# write-ahead log holds data the main file does not yet have -- copied into a
+# private temporary directory first, so a live tool's database, its WAL, and
+# its shared-memory index are never touched. OpenCode's database also keeps its
+# account tokens, so that copy sits in a 0700 directory, under
+# $XDG_RUNTIME_DIR where there is one, and is removed before the command
+# exits. The copy and the report are the only things this command writes.
+
+import argparse
+import calendar
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+
+IDLE_DEFAULT_MINUTES = 15
+
+# Network logs larger than this are split into byte ranges so one busy project
+# does not keep a single worker busy while the others idle.
+NET_CHUNK_BYTES = 8 * 1024 * 1024
+
+TOOL_COLORS = {
+    "claude": 209,
+    "codex": 114,
+    "pi": 177,
+    "pi-durable": 141,
+    "opencode": 80,
+    "mistral-vibe": 214,
+    "amp": 204,
+    "antigravity": 75,
+    "neovim": 108,
+    "theia": 147,
+    "theia-next": 153,
+}
+FALLBACK_COLORS = [180, 116, 218, 150, 110, 223, 189, 152]
+
+HEAT = [22, 28, 34, 46]
+TOKEN_PARTS = (
+    ("input", "input", 39),
+    ("cache_read", "cache read", 30),
+    ("cache_write", "cache write", 105),
+    ("output", "output", 214),
+)
+ACCENT = 75
+DIM = 244
+FAINT = 238
+ALLOW = 114
+DENY = 203
+
+LENGTH_BUCKETS = (
+    ("< 5m", 5 * 60),
+    ("5–15m", 15 * 60),
+    ("15m–1h", 60 * 60),
+    ("1–3h", 3 * 60 * 60),
+    ("3h+", None),
+)
+
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+# --------------------------------------------------------------------------
+# Roots and safe file access
+
+
+def default_roots():
+    """Enclave's config, state, and cache roots, resolved as enclave does."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support", "org.eclipse.enclave")
+        roots = {
+            "config": os.path.join(base, "config"),
+            "state": os.path.join(base, "state"),
+            "cache": os.path.join(home, "Library", "Caches", "org.eclipse.enclave"),
+        }
+    else:
+        # XDG overrides only count when absolute, per the spec and enclave.
+        def xdg(var, fallback):
+            value = os.environ.get(var, "")
+            return value if os.path.isabs(value) else os.path.join(home, fallback)
+
+        roots = {
+            "config": os.path.join(xdg("XDG_CONFIG_HOME", ".config"), "enclave"),
+            "state": os.path.join(xdg("XDG_STATE_HOME", os.path.join(".local", "state")), "enclave"),
+            "cache": os.path.join(xdg("XDG_CACHE_HOME", ".cache"), "enclave"),
+        }
+    # enclave hands its resolved config root to host commands.
+    if os.path.isabs(os.environ.get("ENCLAVE_CONFIG_DIR", "")):
+        roots["config"] = os.environ["ENCLAVE_CONFIG_DIR"]
+    return roots
+
+
+def real_dir(path):
+    """Whether path is a directory itself, not a symlink to one."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def list_dirs(path):
+    """Names of the real subdirectories of path, sorted; [] if unreadable."""
+    try:
+        with os.scandir(path) as it:
+            return sorted(e.name for e in it if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+
+
+_real_roots = {}
+
+
+def safe_file(path, root):
+    """Whether path is a regular file under root, reached without symlinks.
+
+    The root itself may be a symlink -- ~/.local/state on another disk is
+    common -- but nothing below it may be, so a link planted in a store can
+    never lead the scan elsewhere.
+    """
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+    except OSError:
+        return False
+    rel = os.path.relpath(path, root)
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return False
+    real_root = _real_roots.get(root)
+    if real_root is None:
+        real_root = _real_roots[root] = os.path.realpath(root)
+    return os.path.realpath(path) == os.path.join(real_root, rel)
+
+
+def safe_glob(root, *parts):
+    """glob() on an escaped base with a pattern tail, filtered by safe_file."""
+    base = glob.escape(parts[0])
+    pattern = os.path.join(base, *parts[1:])
+    return sorted(p for p in glob.glob(pattern) if safe_file(p, root))
+
+
+def read_json_file(path, root):
+    if not safe_file(path, root):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Timestamps
+
+_hour_cache = {}
+
+
+def parse_ts(s):
+    """Seconds since the epoch for an ISO-8601 timestamp, or None.
+
+    Hand-rolled because the logs carry nanosecond fractions that older
+    datetime.fromisoformat rejects, and because it runs millions of times.
+    """
+    if not isinstance(s, str) or len(s) < 19:
+        return None
+    try:
+        key = s[:13]
+        base = _hour_cache.get(key)
+        if base is None:
+            base = calendar.timegm((int(s[0:4]), int(s[5:7]), int(s[8:10]), int(s[11:13]), 0, 0, 0, 0, 0))
+            _hour_cache[key] = base
+        t = base + int(s[14:16]) * 60 + int(s[17:19])
+    except ValueError:
+        return None
+    i = 19
+    n = len(s)
+    if i < n and s[i] == ".":
+        j = i + 1
+        while j < n and s[j].isdigit():
+            j += 1
+        if j > i + 1:
+            t += float(s[i:j])
+        i = j
+    if i < n and s[i] in "+-" and n - i >= 6:
+        try:
+            offset = int(s[i + 1:i + 3]) * 3600 + int(s[i + 4:i + 6]) * 60
+        except ValueError:
+            offset = 0
+        t += -offset if s[i] == "+" else offset
+    return t
+
+
+def line_key(raw):
+    return hashlib.blake2b(raw, digest_size=8).digest()
+
+
+def as_int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# --------------------------------------------------------------------------
+# Parsers. Each runs in a worker process and returns plain data:
+#
+#   events: [(dedupe key, ts)]          moments the session was doing something
+#   tokens: [(dedupe key, ts, model, input, cache_read, cache_write, output)]
+#
+# "input" is always uncached input. Dedupe keys are message or entry ids where
+# the tool has them, so forked sessions and subagents that replay a shared
+# prefix are counted once.
+
+
+def iter_json_lines(path):
+    with open(path, "rb") as f:
+        for raw in f:
+            if len(raw) < 2:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                yield raw, d
+
+
+def parse_claude(path):
+    events = {}
+    tokens = {}
+    for _, d in iter_json_lines(path):
+        kind = d.get("type")
+        if kind not in ("user", "assistant"):
+            continue
+        ts = parse_ts(d.get("timestamp"))
+        if ts is None:
+            continue
+        uid = d.get("uuid")
+        if uid:
+            events[uid] = ts
+        if kind != "assistant":
+            continue
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            continue
+        usage = msg.get("usage")
+        mid = msg.get("id")
+        model = msg.get("model")
+        if not isinstance(usage, dict) or not mid or model == "<synthetic>":
+            continue
+        # A message is logged once per content block, sometimes with a
+        # still-growing output count; the largest one is the final tally.
+        out = as_int(usage.get("output_tokens"))
+        prev = tokens.get(mid)
+        if prev is None or out >= prev[5]:
+            tokens[mid] = (
+                ts,
+                model or "unknown",
+                as_int(usage.get("input_tokens")),
+                as_int(usage.get("cache_read_input_tokens")),
+                as_int(usage.get("cache_creation_input_tokens")),
+                out,
+            )
+    return {
+        "events": list(events.items()),
+        "tokens": [(k,) + v for k, v in tokens.items()],
+    }
+
+
+def parse_codex(path):
+    sid = None
+    subagent = False
+    model = "unknown"
+    prev = None
+    events = []
+    tokens = []
+    rate = None
+    for raw, d in iter_json_lines(path):
+        ts = parse_ts(d.get("timestamp"))
+        if ts is None:
+            continue
+        kind = d.get("type")
+        payload = d.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        key = line_key(raw)
+        events.append((key, ts))
+        if kind == "session_meta" and sid is None:
+            # A subagent thread names its root session in session_id and
+            # repeats the parent's session_meta after its own, so only the
+            # first one describes this file.
+            sid = payload.get("session_id") or payload.get("id")
+            subagent = bool(sid and payload.get("id") and payload.get("id") != sid)
+        elif kind == "turn_context":
+            model = payload.get("model") or model
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(total, dict):
+                cur = (
+                    as_int(total.get("input_tokens")),
+                    as_int(total.get("cached_input_tokens")),
+                    as_int(total.get("output_tokens")),
+                )
+                # Running totals; a drop means the counter restarted.
+                if prev is None or any(c < p for c, p in zip(cur, prev)):
+                    delta = cur
+                else:
+                    delta = tuple(c - p for c, p in zip(cur, prev))
+                prev = cur
+                if any(delta):
+                    tokens.append((key, ts, model, max(delta[0] - delta[1], 0), delta[1], 0, delta[2]))
+            limits = payload.get("rate_limits")
+            if isinstance(limits, dict):
+                rate = (ts, limits)
+    if not sid:
+        sid = os.path.basename(path)[:-len(".jsonl")]
+    return {"sid": sid, "subagent": subagent, "events": events, "tokens": tokens, "rate": rate}
+
+
+def parse_pi(path):
+    # Entry ids are eight hex digits, unique within a session but not across
+    # them, so they are paired with the entry's timestamp. A fork copies its
+    # parent's entries with both intact, so the shared history counts once.
+    sid = os.path.basename(path)[:-len(".jsonl")]
+    created = None
+    events = []
+    tokens = []
+    for raw, d in iter_json_lines(path):
+        ts = parse_ts(d.get("timestamp"))
+        if ts is None:
+            continue
+        kind = d.get("type")
+        if kind == "session":
+            sid = d.get("id") or sid
+            created = ts if created is None else created
+            continue
+        key = (d["id"], d["timestamp"]) if d.get("id") else line_key(raw)
+        if kind != "message":
+            continue
+        events.append((key, ts))
+        msg = d.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        tokens.append((
+            key,
+            ts,
+            msg.get("model") or "unknown",
+            as_int(usage.get("input")),
+            as_int(usage.get("cacheRead")),
+            as_int(usage.get("cacheWrite")),
+            as_int(usage.get("output")),
+        ))
+    return {"sid": sid, "created": created, "events": events, "tokens": tokens}
+
+
+def open_sqlite_readonly(path, tmpdir):
+    """A read-only connection that cannot touch the live database.
+
+    immutable=1 promises SQLite that nothing changes the file, so it takes no
+    locks and writes nothing -- but it also ignores the WAL. When the WAL holds
+    data, the database and WAL are copied into a private directory instead.
+    """
+    # The database passed safe_file; its WAL did not, so it is opened without
+    # following a link and must be a regular file, or it is ignored.
+    try:
+        wal = os.open(path + "-wal", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        wal = None
+    if wal is not None:
+        with os.fdopen(wal, "rb") as src:
+            st = os.fstat(src.fileno())
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                copy_dir = tempfile.mkdtemp(prefix="sqlite-", dir=tmpdir)
+                target = os.path.join(copy_dir, "db.sqlite")
+                shutil.copyfile(path, target)
+                with open(target + "-wal", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                return sqlite3.connect(target)
+    uri = "file:" + path.replace("?", "%3f").replace("#", "%23") + "?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
+
+def parse_opencode(path, tmpdir):
+    sessions = {}
+    try:
+        conn = open_sqlite_readonly(path, tmpdir)
+    except (OSError, sqlite3.Error):
+        return {"sessions": sessions}
+    try:
+        parents = {}
+        try:
+            for sid, parent in conn.execute("SELECT id, parent_id FROM session"):
+                parents[sid] = parent
+        except sqlite3.Error:
+            pass
+
+        def root(sid):
+            seen = set()
+            while parents.get(sid) and sid not in seen:
+                seen.add(sid)
+                sid = parents[sid]
+            return sid
+
+        rows = conn.execute("SELECT id, session_id, time_created, data FROM message")
+        for mid, sid, created, data in rows:
+            try:
+                d = json.loads(data)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            s = sessions.setdefault(root(sid), {"events": [], "tokens": []})
+            times = d.get("time") if isinstance(d.get("time"), dict) else {}
+            start = as_int(times.get("created") or created) / 1000.0
+            if start <= 0:
+                continue
+            s["events"].append((mid, start))
+            done = as_int(times.get("completed")) / 1000.0
+            if done > start:
+                s["events"].append(((mid, "done"), done))
+            tok = d.get("tokens")
+            if d.get("role") == "assistant" and isinstance(tok, dict):
+                cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+                s["tokens"].append((
+                    mid,
+                    done or start,
+                    d.get("modelID") or "unknown",
+                    as_int(tok.get("input")),
+                    as_int(cache.get("read")),
+                    as_int(cache.get("write")),
+                    as_int(tok.get("output")) + as_int(tok.get("reasoning")),
+                ))
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return {"sessions": sessions}
+
+
+def parse_vibe(path):
+    with open(path, "rb") as f:
+        try:
+            d = json.loads(f.read())
+        except ValueError:
+            return None
+    if not isinstance(d, dict):
+        return None
+    sid = d.get("session_id") or os.path.basename(os.path.dirname(path))
+    start = parse_ts(d.get("start_time"))
+    end = parse_ts(d.get("end_time")) or start
+    if start is None:
+        return None
+    # Vibe records only when a session started and ended, so the span between
+    # them counts as active, in steps short enough to pass any idle cutoff.
+    end = min(max(end, start), start + 24 * 3600)
+    events = []
+    t = start
+    while t < end:
+        events.append(("%s@%d" % (sid, t), t))
+        t += 60
+    events.append(("%s@end" % sid, end))
+    tokens = []
+    st = d.get("stats")
+    if isinstance(st, dict):
+        prompt = as_int(st.get("session_prompt_tokens"))
+        cached = as_int(st.get("session_cached_tokens"))
+        config = d.get("config") if isinstance(d.get("config"), dict) else {}
+        tokens.append((
+            sid,
+            end,
+            config.get("active_model") or "unknown",
+            max(prompt - cached, 0),
+            cached,
+            0,
+            as_int(st.get("session_completion_tokens")),
+        ))
+    return {"sid": d.get("parent_session_id") or sid, "events": events, "tokens": tokens}
+
+
+def parse_network(path, start, end, since_iso):
+    """Aggregate one byte range of a gateway network log.
+
+    A line belongs to the range it starts in, so ranges can split a file at
+    arbitrary offsets without losing or double-counting lines.
+    """
+    kinds = collections.Counter()
+    allowed = collections.Counter()
+    denied = collections.Counter()
+    status = collections.Counter()
+    req_bytes = resp_bytes = starts = 0
+    with open(path, "rb") as f:
+        pos = start
+        if start > 0:
+            f.seek(start - 1)
+            pos = start - 1 + len(f.readline())
+        while pos < end:
+            raw = f.readline()
+            if not raw:
+                break
+            pos += len(raw)
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("ts")
+            if not isinstance(ts, str):
+                continue
+            if since_iso and ts[:19] < since_iso:
+                continue
+            kind = d.get("type")
+            verdict = d.get("verdict")
+            rule = d.get("rule")
+            kinds[(kind, verdict, rule)] += 1
+            if kind == "session":
+                starts += 1
+                continue
+            domain = d.get("domain") or "(no name)"
+            if verdict == "deny":
+                denied[(domain, rule)] += 1
+            elif kind == "http" or (kind == "tcp" and rule != "mitm-dispatch"):
+                # A MITM'd connection shows up again as its HTTP requests.
+                allowed[domain] += 1
+            if kind == "http":
+                req_bytes += as_int(d.get("req_bytes"))
+                resp_bytes += as_int(d.get("resp_bytes"))
+                code = as_int(d.get("status"))
+                if code:
+                    status["%dxx" % (code // 100)] += 1
+    return {
+        "kinds": kinds,
+        "allowed": allowed,
+        "denied": denied,
+        "status": status,
+        "req_bytes": req_bytes,
+        "resp_bytes": resp_bytes,
+        "starts": starts,
+    }
+
+
+def disk_usage(path):
+    """Allocated bytes under path, without following symlinks."""
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    total += getattr(st, "st_blocks", 0) * 512 or st.st_size
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+        except OSError:
+            continue
+    return total
+
+
+PARSERS = {
+    "claude": lambda job: parse_claude(job[1]),
+    "codex": lambda job: parse_codex(job[1]),
+    "pi": lambda job: parse_pi(job[1]),
+    "opencode": lambda job: parse_opencode(job[1], job[5]),
+    "vibe": lambda job: parse_vibe(job[1]),
+    "net": lambda job: parse_network(job[1], job[5], job[6], job[7]),
+    "disk": lambda job: disk_usage(job[1]),
+}
+
+
+def run_job(job):
+    """Worker entry point: (job, data, error), where data is None on error.
+
+    A file in a shape no parser expected costs that file, not the report.
+    """
+    try:
+        return job, PARSERS[job[0]](job), None
+    except Exception as e:  # noqa: BLE001 -- reported, never fatal
+        if isinstance(e, OSError) and e.strerror:
+            return job, None, e.strerror
+        return job, None, "%s: %s" % (type(e).__name__, e)
+
+
+# --------------------------------------------------------------------------
+# Discovery
+
+
+class Scan:
+    def __init__(self, roots, tools, project_filter, since, disk):
+        self.roots = roots
+        self.tools = tools
+        self.project_filter = project_filter
+        self.since = since
+        self.disk = disk
+        self.projects = {}  # hash -> path
+        self.jobs = []
+        self.conversations = []  # (tool, project, sid, mtime) without transcripts
+        self.gateways = collections.Counter()  # mode -> count
+        self.stores = collections.Counter()  # tool -> extra config-store keys
+        self.memory = collections.Counter()  # tool -> files
+        self.memory_projects = collections.defaultdict(set)
+        self.shell_lines = collections.Counter()  # tool -> lines
+        self.tool_mtime = {}  # tool -> latest network-log mtime
+        self.tool_projects = collections.defaultdict(set)
+
+
+def project_path(scan, phash):
+    for root in (scan.roots["state"], scan.roots["config"]):
+        d = read_json_file(os.path.join(root, "projects", phash, "project.json"), root)
+        if isinstance(d, dict) and isinstance(d.get("path"), str):
+            return d["path"]
+    return None
+
+
+def count_files(path, limit=100000):
+    """Visible files under path; Codex keeps its memory in a git repository."""
+    n = 0
+    stack = [path]
+    while stack and n < limit:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    if e.name.startswith("."):
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.is_file(follow_symlinks=False):
+                        n += 1
+        except OSError:
+            continue
+    return n
+
+
+def count_lines(path, root):
+    if not safe_file(path, root):
+        return 0
+    n = 0
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                n += block.count(b"\n")
+    except OSError:
+        return 0
+    return n
+
+
+def discover(scan, tmpdir):
+    root = scan.roots["state"]
+    since_iso = None
+    if scan.since:
+        since_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(scan.since))
+    projects_dir = os.path.join(scan.roots["state"], "projects")
+    for phash in list_dirs(projects_dir):
+        pdir = os.path.join(projects_dir, phash)
+        path = project_path(scan, phash)
+        if scan.project_filter and (path is None or scan.project_filter not in path):
+            continue
+        scan.projects[phash] = path
+        for tool in list_dirs(pdir):
+            if scan.tools and tool not in scan.tools:
+                continue
+            tdir = os.path.join(pdir, tool)
+            scan.tool_projects[tool].add(phash)
+            store_root = os.path.join(tdir, "config-store")
+            keys = list_dirs(store_root)
+            scan.stores[tool] += sum(1 for k in keys if k != "default")
+            for key in keys:
+                s = os.path.join(store_root, key)
+                for f in safe_glob(root, s, "projects", "*", "*.jsonl"):
+                    sid = os.path.basename(f)[:-len(".jsonl")]
+                    scan.jobs.append(("claude", f, tool, phash, sid))
+                for f in safe_glob(root, s, "projects", "*", "*", "subagents", "*.jsonl"):
+                    sid = os.path.basename(os.path.dirname(os.path.dirname(f)))
+                    scan.jobs.append(("claude", f, tool, phash, sid))
+                for f in (safe_glob(root, s, "sessions", "*", "*", "*", "rollout-*.jsonl")
+                          + safe_glob(root, s, "archived_sessions", "rollout-*.jsonl")):
+                    scan.jobs.append(("codex", f, tool, phash, None))
+                for f in safe_glob(root, s, "agent", "sessions", "*", "*.jsonl"):
+                    scan.jobs.append(("pi", f, tool, phash, None))
+                db = os.path.join(s, "opencode.db")
+                if safe_file(db, root):
+                    scan.jobs.append(("opencode", db, tool, phash, None, tmpdir))
+                for f in safe_glob(root, s, "logs", "session", "*", "meta.json"):
+                    scan.jobs.append(("vibe", f, tool, phash, None))
+                # Antigravity keeps conversations as protobuf databases, and
+                # Pi's experimental durable sessions one SQLite file each; their
+                # count and modification time are all this report reads.
+                for f in safe_glob(root, s, "antigravity-cli", "conversations", "*.db"):
+                    sid = os.path.basename(f)[:-len(".db")]
+                    scan.conversations.append((tool, phash, sid, os.lstat(f).st_mtime))
+                for f in safe_glob(root, s, "agent", "experimental", "durable-sessions", "*", "*", "session.sqlite"):
+                    sid = os.path.basename(os.path.dirname(f))
+                    scan.conversations.append((tool, phash, sid, os.lstat(f).st_mtime))
+            net = os.path.join(tdir, "logs", "network.log")
+            if safe_file(net, root):
+                st = os.lstat(net)
+                scan.tool_mtime[tool] = max(scan.tool_mtime.get(tool, 0), st.st_mtime)
+                for offset in range(0, st.st_size, NET_CHUNK_BYTES):
+                    scan.jobs.append(("net", net, tool, phash, None, offset,
+                                      min(offset + NET_CHUNK_BYTES, st.st_size), since_iso))
+            meta = read_json_file(os.path.join(tdir, "gateway-config", "meta.json"), root)
+            if isinstance(meta, dict):
+                scan.gateways[str(meta.get("mode") or "unknown")] += 1
+            mem = os.path.join(tdir, "memory")
+            if real_dir(mem):
+                n = count_files(mem)
+                if n:
+                    scan.memory[tool] += n
+                    scan.memory_projects[tool].add(phash)
+            for f in safe_glob(root, tdir, "history", "*_history"):
+                scan.shell_lines[tool] += count_lines(f, root)
+    if scan.disk:
+        add_disk_jobs(scan)
+
+
+def add_disk_jobs(scan):
+    # One job per project directory and per cache subtree, so the walk spreads
+    # across workers instead of serializing on the biggest tree.
+    state = scan.roots["state"]
+    for name in list_dirs(state):
+        top = os.path.join(state, name)
+        if name == "projects":
+            for phash in scan.projects:
+                pdir = os.path.join(top, phash)
+                for tool in list_dirs(pdir):
+                    if not scan.tools or tool in scan.tools:
+                        scan.jobs.append(("disk", os.path.join(pdir, tool), "state", tool, None))
+        elif not scan.tools and not scan.project_filter:
+            scan.jobs.append(("disk", top, "state", "(" + name + ")", None))
+    cache = scan.roots["cache"]
+    for name in list_dirs(cache):
+        top = os.path.join(cache, name)
+        if scan.tools and name not in scan.tools:
+            continue
+        # Per-tool caches hold one directory per project; the rest (assets,
+        # build, microvm) are Enclave's own and are labelled as such.
+        label = name if name in scan.tool_projects else "(" + name + ")"
+        subdirs = list_dirs(top)
+        if scan.project_filter:
+            subdirs = [s for s in subdirs if s in scan.projects]
+            if not subdirs:
+                continue
+        elif not subdirs:
+            scan.jobs.append(("disk", top, "cache", label, None))
+            continue
+        for sub in subdirs:
+            scan.jobs.append(("disk", os.path.join(top, sub), "cache", label, None))
+
+
+def job_weight(job):
+    if job[0] == "net":
+        return job[6] - job[5]
+    if job[0] == "disk":
+        return 1 << 40
+    try:
+        return os.lstat(job[1]).st_size
+    except OSError:
+        return 0
+
+
+def run_jobs(jobs):
+    jobs = sorted(jobs, key=job_weight, reverse=True)
+    workers = min(os.cpu_count() or 1, 16)
+    if workers > 1 and len(jobs) > 8:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                return list(pool.map(run_job, jobs, chunksize=2))
+        except (OSError, ImportError, RuntimeError):
+            pass  # no process support here; fall through to one process
+    return [run_job(j) for j in jobs]
+
+
+# --------------------------------------------------------------------------
+# Aggregation
+
+
+class Session:
+    __slots__ = ("tool", "project", "sid", "events", "active", "start", "end")
+
+    def __init__(self, tool, project, sid):
+        self.tool = tool
+        self.project = project
+        self.sid = sid
+        self.events = []
+        self.active = 0.0
+        self.start = None
+        self.end = None
+
+
+def zero_tokens():
+    return [0, 0, 0, 0]
+
+
+def add_tokens(acc, values):
+    for i, v in enumerate(values):
+        acc[i] += v
+
+
+class Report:
+    def __init__(self):
+        self.sessions = {}
+        self.models = collections.defaultdict(zero_tokens)
+        self.model_tools = collections.defaultdict(set)
+        self.tool_tokens = collections.defaultdict(zero_tokens)
+        self.project_tokens = collections.defaultdict(zero_tokens)
+        self.rate = None
+        self.net = None
+        self.net_tools = collections.Counter()
+        self.disk = collections.defaultdict(lambda: [0, 0])  # tool -> [state, cache]
+        self.intervals = []  # (start, end), from every session
+        self.gateway_only = {}  # tool -> session starts from network logs
+        self.tool_mtime = {}
+        self.subagents = collections.Counter()  # parser kind -> subagent transcripts
+        self.errors = []  # (path, message) for files that could not be read
+
+
+def aggregate(scan, results, idle):
+    rep = Report()
+    rep.tool_mtime = scan.tool_mtime
+    since = scan.since or 0
+    seen_events = set()
+    seen_tokens = set()
+
+    def session(tool, project, sid):
+        key = (tool, project, sid)
+        s = rep.sessions.get(key)
+        if s is None:
+            s = rep.sessions[key] = Session(tool, project, sid)
+        return s
+
+    def take(kind, s, data):
+        for key, ts in data["events"]:
+            k = (kind, key)
+            if k in seen_events:
+                continue
+            seen_events.add(k)
+            if ts >= since:
+                s.events.append(ts)
+        for key, ts, model, inp, cr, cw, out in data["tokens"]:
+            k = (kind, key)
+            if k in seen_tokens:
+                continue
+            seen_tokens.add(k)
+            if ts < since:
+                continue
+            values = (inp, cr, cw, out)
+            add_tokens(rep.models[model], values)
+            rep.model_tools[model].add(s.tool)
+            add_tokens(rep.tool_tokens[s.tool], values)
+            add_tokens(rep.project_tokens[s.project], values)
+
+    def earliest(item):
+        job, data, _ = item
+        events = data.get("events") if isinstance(data, dict) else None
+        first = min(t for _, t in events) if events else float("inf")
+        created = data.get("created") if isinstance(data, dict) else None
+        return (first, created or 0, job[1], job[5] if job[0] == "net" else 0)
+
+    # Forks replay their parent's history: whichever file is seen first owns a
+    # shared event, so walk files oldest first and let originals win. A Pi
+    # fork starts with its parent's first event; its later header breaks the tie.
+    results = sorted(results, key=earliest)
+    net_parts = []
+    for job, data, error in results:
+        if error:
+            rep.errors.append((job[1], error))
+        if data is None:
+            continue
+        kind, path, tool, project = job[0], job[1], job[2], job[3]
+        if kind == "claude":
+            take(kind, session(tool, project, job[4]), data)
+            if "/subagents/" in path:
+                rep.subagents["Claude"] += 1
+        elif kind in ("codex", "pi", "vibe"):
+            take(kind, session(tool, project, data["sid"]), data)
+            if kind == "codex":
+                if data["subagent"]:
+                    rep.subagents["Codex"] += 1
+                if data["rate"] and (rep.rate is None or data["rate"][0] > rep.rate[0]):
+                    rep.rate = data["rate"]
+        elif kind == "opencode":
+            for sid, sdata in sorted(data["sessions"].items()):
+                take(kind, session(tool, project, sid), sdata)
+        elif kind == "net":
+            net_parts.append(data)
+            rep.net_tools[tool] += data["starts"]
+        elif kind == "disk":
+            rep.disk[project][0 if tool == "state" else 1] += data
+
+    for tool, project, sid, mtime in scan.conversations:
+        if mtime >= since:
+            s = session(tool, project, sid)
+            s.start = s.end = mtime
+
+    for s in rep.sessions.values():
+        if not s.events:
+            continue
+        s.events.sort()
+        s.start, s.end = s.events[0], s.events[-1]
+        lo = prev = s.events[0]
+        for t in s.events[1:]:
+            if t - prev > idle:
+                if prev > lo:
+                    rep.intervals.append((lo, prev))
+                    s.active += prev - lo
+                lo = t
+            prev = t
+        if prev > lo:
+            rep.intervals.append((lo, prev))
+            s.active += prev - lo
+        s.events = None  # the intervals carry everything the report needs
+
+    rep.sessions = {k: s for k, s in rep.sessions.items() if s.start is not None}
+
+    if net_parts:
+        rep.net = merge_network(net_parts)
+    # Tools without transcripts this report can read are still visible in the
+    # gateway's session-start events -- for the sessions that had a gateway.
+    with_sessions = {s.tool for s in rep.sessions.values()}
+    for tool, n in rep.net_tools.items():
+        if tool not in with_sessions and n:
+            rep.gateway_only[tool] = n
+    return rep
+
+
+def merge_network(parts):
+    net = {
+        "kinds": collections.Counter(),
+        "allowed": collections.Counter(),
+        "denied": collections.Counter(),
+        "status": collections.Counter(),
+        "req_bytes": 0,
+        "resp_bytes": 0,
+        "starts": 0,
+    }
+    for p in parts:
+        for k in ("kinds", "allowed", "denied", "status"):
+            net[k].update(p[k])
+        for k in ("req_bytes", "resp_bytes", "starts"):
+            net[k] += p[k]
+    return net
+
+
+def union(intervals):
+    merged = []
+    for lo, hi in sorted(intervals):
+        if merged and lo <= merged[-1][1]:
+            if hi > merged[-1][1]:
+                merged[-1][1] = hi
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+def spread_by_hour(merged):
+    """Seconds of wall-clock activity per local (date, hour)."""
+    out = collections.Counter()
+    for lo, hi in merged:
+        t = lo
+        while t < hi:
+            lt = time.localtime(t)
+            nxt = min(hi, t - (lt.tm_min * 60 + lt.tm_sec + (t % 1)) + 3600)
+            if nxt <= t:
+                nxt = min(hi, t + 3600)
+            out[(datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday), lt.tm_hour)] += nxt - t
+            t = nxt
+    return out
+
+
+# --------------------------------------------------------------------------
+# Rendering
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Paint:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def __call__(self, text, fg=None, bold=False, dim=False, bg=None):
+        if not self.enabled or text == "":
+            return text
+        codes = []
+        if bold:
+            codes.append("1")
+        if dim:
+            codes.append("2")
+        if fg is not None:
+            codes.append("38;5;%d" % fg)
+        if bg is not None:
+            codes.append("48;5;%d" % bg)
+        if not codes:
+            return text
+        return "\x1b[%sm%s\x1b[0m" % (";".join(codes), text)
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def pad(s, width, right=False):
+    gap = max(width - vlen(s), 0)
+    return (" " * gap + s) if right else (s + " " * gap)
+
+
+def ellipsize(s, width, left=False):
+    if len(s) <= width:
+        return s
+    if width <= 1:
+        return s[:width]
+    return ("…" + s[-(width - 1):]) if left else (s[:width - 1] + "…")
+
+
+def fmt_num(n):
+    n = float(n)
+    for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= div:
+            v = n / div
+            return ("%.1f%s" % (v, suffix)) if v < 100 else ("%.0f%s" % (v, suffix))
+    return "%d" % n
+
+
+def fmt_bytes(n):
+    n = float(n)
+    for div, suffix in ((1 << 40, "T"), (1 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")):
+        if n >= div:
+            v = n / div
+            return ("%.1f%s" % (v, suffix)) if v < 100 else ("%.0f%s" % (v, suffix))
+    return "%dB" % n
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%ds" % sec
+    m = sec // 60
+    if m < 60:
+        return "%dm" % m
+    h, m = divmod(m, 60)
+    if h >= 100 or m == 0:
+        return "%dh" % h
+    return "%dh %dm" % (h, m)
+
+
+def fmt_ago(ts, now):
+    if ts is None:
+        return "–"
+    d = now - ts
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 86400:
+        return "%dh ago" % (d // 3600)
+    if d < 45 * 86400:
+        return "%dd ago" % (d // 86400)
+    return time.strftime("%b %d %Y", time.localtime(ts))
+
+
+def count(n, word, plural=None):
+    """n formatted for a sentence, with word in the matching number."""
+    return "%s %s" % (fmt_num(n), word if n == 1 else (plural or word + "s"))
+
+
+def fmt_pct(part, whole):
+    if not whole:
+        return "–"
+    p = 100.0 * part / whole
+    return ("%.1f%%" % p) if p < 10 else ("%.0f%%" % p)
+
+
+def tool_color(tool):
+    if tool in TOOL_COLORS:
+        return TOOL_COLORS[tool]
+    return FALLBACK_COLORS[sum(map(ord, tool)) % len(FALLBACK_COLORS)]
+
+
+EIGHTHS = " ▏▎▍▌▋▊▉"
+
+
+def bar(paint, value, maxval, width, color):
+    if maxval <= 0 or width <= 0:
+        return ""
+    cells = max(0.0, min(1.0, float(value) / maxval)) * width
+    full = int(cells)
+    rest = int((cells - full) * 8)
+    s = "█" * full + (EIGHTHS[rest] if rest and full < width else "")
+    if not s and value > 0:
+        s = "▏"
+    return paint(s, fg=color)
+
+
+def stacked(paint, parts, width, total=None):
+    """A bar of width cells split among (value, color) parts by largest remainder."""
+    total = total if total is not None else sum(v for v, _ in parts)
+    if total <= 0 or width <= 0:
+        return ""
+    exact = [float(v) / total * width for v, _ in parts]
+    cells = [int(e) for e in exact]
+    want = int(round(sum(exact)))
+    order = sorted(range(len(parts)), key=lambda i: exact[i] - cells[i], reverse=True)
+    for i in order[:max(want - sum(cells), 0)]:
+        cells[i] += 1
+    # A non-zero part never vanishes entirely.
+    for i, (v, _) in enumerate(parts):
+        if v > 0 and cells[i] == 0:
+            j = max(range(len(parts)), key=lambda k: cells[k])
+            if cells[j] > 1:
+                cells[j] -= 1
+                cells[i] = 1
+    return "".join(paint("█" * c, fg=color) for c, (_, color) in zip(cells, parts) if c)
+
+
+def levels(values):
+    """Quartile thresholds over the non-zero values, GitHub-calendar style."""
+    nz = sorted(v for v in values if v > 0)
+    if not nz:
+        return [1, 1, 1]
+    return [nz[min(len(nz) - 1, int(len(nz) * q))] for q in (0.25, 0.5, 0.75)]
+
+
+def heat_cell(paint, value, thresholds, width=2):
+    if value <= 0:
+        ch = "·" if paint.enabled else " "
+        return paint(ch, fg=FAINT) + " " * (width - 1)
+    level = sum(1 for t in thresholds if value > t)
+    if paint.enabled:
+        return paint("■", fg=HEAT[level]) + " " * (width - 1)
+    return "░▒▓█"[level] + " " * (width - 1)
+
+
+def clip(s, width):
+    """s cut to width visible characters, keeping its colour codes intact."""
+    if vlen(s) <= width:
+        return s
+    out = []
+    seen = 0
+    i = 0
+    while i < len(s):
+        m = ANSI.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        if seen == width - 1:
+            out.append("…")
+            break
+        out.append(s[i])
+        seen += 1
+        i += 1
+    return "".join(out) + ("\x1b[0m" if "\x1b[" in s else "")
+
+
+class Out:
+    def __init__(self, paint, width):
+        self.paint = paint
+        self.width = width
+        self.lines = []
+
+    def line(self, s=""):
+        # Layouts budget their columns; this only catches data nobody
+        # budgeted for, such as a very long model or tool name.
+        self.lines.append(clip(s.rstrip(), self.width))
+
+    def wrap(self, parts, sep=" · ", indent="  ", **style):
+        """Join parts with sep, breaking between parts to fit the width."""
+        line = ""
+        for part in parts:
+            if line and vlen(indent + line + sep + part) > self.width:
+                self.line(indent + self.paint(line, **style))
+                line = part
+            else:
+                line = (line + sep + part) if line else part
+        if line:
+            self.line(indent + self.paint(line, **style))
+
+    def note(self, text):
+        """A dim footnote, word-wrapped under a two-space indent."""
+        self.wrap(text.split(" "), sep=" ", fg=DIM)
+
+    def section(self, title, note=""):
+        p = self.paint
+        head = p("━━ ", fg=ACCENT) + p(title, bold=True)
+        if note:
+            room = self.width - vlen(head) - 4
+            if room > 10:
+                head += "  " + p(ellipsize(note, room), fg=DIM)
+        rest = self.width - vlen(head) - 1
+        if rest > 0:
+            head += " " + p("─" * rest, fg=FAINT)
+        self.line()
+        self.line(head)
+
+    def text(self):
+        return "\n".join(self.lines) + "\n"
+
+
+def render(scan, rep, args, running, elapsed):
+    paint = Paint(args.color)
+    out = Out(paint, args.width)
+    now = time.time()
+    sessions = list(rep.sessions.values())
+    timed = [s for s in sessions if s.active > 0]
+    merged = union(rep.intervals)
+    wall = sum(hi - lo for lo, hi in merged)
+    session_time = sum(s.active for s in sessions)
+    by_hour = spread_by_hour(merged)
+    by_day = collections.Counter()
+    for (day, _), sec in by_hour.items():
+        by_day[day] += sec
+    all_tokens = zero_tokens()
+    for v in rep.tool_tokens.values():
+        add_tokens(all_tokens, v)
+    total_tokens = sum(all_tokens)
+
+    starts = [s.start for s in sessions if s.start]
+    first = min(starts) if starts else None
+
+    # ---- header
+    title = paint(" enclave stats ", bold=True, fg=16, bg=ACCENT)
+    span = ""
+    if first:
+        d0 = datetime.date.fromtimestamp(scan.since or first)
+        d1 = datetime.date.fromtimestamp(now)
+        span = "%s – %s  (%d days)" % (d0.strftime("%b %d %Y"), d1.strftime("%b %d %Y"), (d1 - d0).days + 1)
+    scope = []
+    if scan.tools:
+        scope.append("tools: " + ", ".join(sorted(scan.tools)))
+    if scan.project_filter:
+        scope.append("projects matching “%s”" % scan.project_filter)
+    out.line(title + "  " + paint(span, bold=True) + ("  " + paint(" · ".join(scope), fg=DIM) if scope else ""))
+
+    if not sessions and not rep.net and not rep.gateway_only:
+        out.line()
+        out.line(paint("No Enclave sessions found under %s." % scan.roots["state"], fg=DIM))
+        return out.text()
+
+    # ---- tiles
+    days_active = sum(1 for v in by_day.values() if v >= 60)
+    days_span = (datetime.date.fromtimestamp(now) - datetime.date.fromtimestamp(scan.since or first)).days + 1 if first else 0
+    longest, current = streaks(by_day, datetime.date.fromtimestamp(now))
+    n_projects = len({s.project for s in sessions})
+    tiles = [
+        ("SESSIONS", "%d" % len(sessions), count(n_projects, "project")),
+        ("SESSION TIME", fmt_dur(session_time), "sessions summed"),
+        ("WALL-CLOCK", fmt_dur(wall), ("%.1f× parallel" % (session_time / wall)) if wall else ""),
+        ("TOKENS", fmt_num(total_tokens), ("%s cached" % fmt_pct(all_tokens[1], total_tokens)) if total_tokens else ""),
+        ("ACTIVE DAYS", "%d/%d" % (days_active, days_span), "streak %dd, best %dd" % (current, longest)),
+    ]
+    if running is not None:
+        by_tool = collections.Counter(c.get("tool") or "?" for c in running)
+        tiles.append(("RUNNING NOW", "%d" % len(running),
+                      " ".join("%s×%d" % (t, n) for t, n in by_tool.most_common(2))))
+    render_tiles(out, tiles)
+
+    # ---- tools
+    render_tools(out, rep, sessions, session_time, now)
+
+    # ---- activity
+    if by_day:
+        render_calendar(out, by_day, scan.since or first, now)
+        render_hours(out, by_hour, wall)
+    if timed:
+        render_lengths(out, timed, args.idle)
+
+    # ---- tokens
+    if total_tokens:
+        render_tokens(out, rep, all_tokens, args.top)
+
+    # ---- projects
+    render_projects(out, scan, rep, sessions, now, args.top)
+
+    # ---- habits
+    render_habits(out, scan, rep, sessions)
+
+    # ---- network
+    if rep.net:
+        render_network(out, scan, rep, args.top)
+
+    # ---- disk
+    if args.disk:
+        render_disk(out, rep)
+
+    out.line()
+    if rep.errors:
+        path, error = rep.errors[0]
+        if len(rep.errors) == 1:
+            out.note("1 file could not be read and was left out (%s):" % error)
+        else:
+            out.note("%s could not be read and were left out; the first (%s):" % (
+                count(len(rep.errors), "file"), error))
+        rel = os.path.relpath(path, scan.roots["state"])
+        out.line("    " + paint(ellipsize(rel, out.width - 4, left=True), fg=DIM))
+    roots = [scan.roots["state"], scan.roots["config"]] + ([scan.roots["cache"]] if args.disk else [])
+    home = os.path.expanduser("~")
+    shown = ", ".join(r.replace(home, "~", 1) for r in roots)
+    hint = "" if args.disk else " · --disk adds disk usage"
+    out.note("Read-only scan of %s in %.1fs%s · -h for options" % (shown, elapsed, hint))
+    return out.text()
+
+
+def streaks(by_day, today):
+    days = sorted(d for d, v in by_day.items() if v >= 60)
+    longest = run = 0
+    prev = None
+    for d in days:
+        run = run + 1 if prev and (d - prev).days == 1 else 1
+        longest = max(longest, run)
+        prev = d
+    current = 0
+    d = today
+    active = set(days)
+    if d not in active:
+        d -= datetime.timedelta(days=1)  # today may simply not have started yet
+    while d in active:
+        current += 1
+        d -= datetime.timedelta(days=1)
+    return longest, current
+
+
+def render_tiles(out, tiles):
+    p = out.paint
+    # Natural widths, packed into rows, then the slack spread evenly so the
+    # gaps between tiles match.
+    widths = [max(len(label), len(value), len(sub)) + 2 for label, value, sub in tiles]
+    rows = [[]]
+    used = 2
+    for tile, w in zip(tiles, widths):
+        if rows[-1] and used + w > out.width:
+            rows.append([])
+            used = 2
+        rows[-1].append([tile, w])
+        used += w
+    for row in rows:
+        slack = (out.width - 2 - sum(w for _, w in row)) // len(row)
+        for cell in row:
+            cell[1] += min(slack, 8)
+        out.line()
+        for part, style in ((0, {"fg": DIM}), (1, {"bold": True, "fg": ACCENT}), (2, {"fg": DIM})):
+            out.line(("  " + "".join(pad(p(tile[part], **style), w) for tile, w in row)).rstrip())
+
+
+def render_tools(out, rep, sessions, session_time, now):
+    p = out.paint
+    per = collections.OrderedDict()
+    for s in sessions:
+        t = per.setdefault(s.tool, {"n": 0, "time": 0.0, "lens": [], "last": None, "timed": False})
+        t["n"] += 1
+        t["time"] += s.active
+        if s.active > 0:
+            t["lens"].append(s.active)
+        if s.end is not None:
+            t["timed"] = t["timed"] or s.active > 0
+            t["last"] = max(t["last"] or 0, s.end)
+    marks = {}
+    for tool, n in rep.gateway_only.items():
+        per[tool] = {"n": n, "time": 0.0, "lens": [], "last": None, "timed": False}
+        marks[tool] = "†"
+    if not per:
+        return
+    for tool in per:
+        if tool not in rep.gateway_only and not per[tool]["timed"]:
+            marks[tool] = "‡"
+        if per[tool]["last"] is None:
+            # No event timestamps: the network log's mtime is the best signal.
+            per[tool]["last"] = None if tool not in rep.tool_mtime else rep.tool_mtime[tool]
+
+    out.section("Tools", "by session time")
+    name_w = max(8, max(len(t) for t in per) + 4)
+    # Fixed columns take name_w + 45, the median 8 more; the share bar gets the
+    # rest, and on a narrow terminal the median goes first.
+    show_median = out.width - name_w - 53 >= 10
+    bar_w = max(out.width - name_w - (53 if show_median else 45), 0)
+    out.line(p("  " + pad("", name_w) + pad("sessions", 9, True) + pad("time", 10, True)
+               + (pad("median", 8, True) if show_median else "") + pad("tokens", 9, True)
+               + "  " + pad("share of time" if bar_w >= 14 else "share", bar_w) + " last used", fg=DIM))
+    order = sorted(per.items(), key=lambda kv: (kv[1]["time"], kv[1]["n"]), reverse=True)
+    for tool, t in order:
+        color = tool_color(tool)
+        lens = sorted(t["lens"])
+        median = fmt_dur(lens[len(lens) // 2]) if lens else "–"
+        tokens = sum(rep.tool_tokens.get(tool, zero_tokens()))
+        name = p("●", fg=color) + " " + p(ellipsize(tool, name_w - 4), bold=True) + p(marks.get(tool, ""), fg=DIM)
+        out.line("  " + pad(name, name_w)
+                 + pad(str(t["n"]), 9, True)
+                 + pad(fmt_dur(t["time"]) if t["time"] else "–", 10, True)
+                 + (pad(median, 8, True) if show_median else "")
+                 + pad(fmt_num(tokens) if tokens else "–", 9, True)
+                 + "  " + pad(bar(p, t["time"], session_time, bar_w, color), bar_w)
+                 + " " + p(fmt_ago(t["last"], now), fg=DIM))
+    if any(m == "†" for m in marks.values()):
+        out.note("† no transcripts: counted from gateway logs, which miss sessions without a gateway")
+    if any(m == "‡" for m in marks.values()):
+        out.note("‡ conversation files only: no timing or token data")
+    if rep.rate:
+        ts, limits = rep.rate
+        parts = []
+        for key in ("primary", "secondary"):
+            lim = limits.get(key)
+            if isinstance(lim, dict) and lim.get("used_percent") is not None:
+                window = as_int(lim.get("window_minutes"))
+                label = ("%dh" % (window // 60)) if window and window < 1440 else ("%dd" % (window // 1440) if window else key)
+                parts.append("%s window %.0f%% used" % (label, float(lim.get("used_percent") or 0)))
+        if parts:
+            out.note("codex rate limits as of %s: %s" % (fmt_ago(ts, now), " · ".join(parts)))
+
+
+def render_calendar(out, by_day, first, now):
+    p = out.paint
+    today = datetime.date.fromtimestamp(now)
+    start = datetime.date.fromtimestamp(first)
+    start -= datetime.timedelta(days=start.weekday())
+    weeks = (today - start).days // 7 + 1
+    fit = max(4, (out.width - 8) // 2)
+    if weeks > fit:
+        start += datetime.timedelta(weeks=weeks - fit)
+        weeks = fit
+    thresholds = levels(by_day.values())
+    out.section("Activity", "wall-clock time per day")
+    months = [" "] * (weeks * 2 + 2)
+    prev_month = None
+    for w in range(weeks):
+        monday = start + datetime.timedelta(weeks=w)
+        if monday.month != prev_month:
+            label = monday.strftime("%b")
+            if all(c == " " for c in months[w * 2:w * 2 + len(label) + 1]):
+                months[w * 2:w * 2 + len(label)] = list(label)
+            prev_month = monday.month
+    out.line("       " + p("".join(months).rstrip(), fg=DIM))
+    for wd in range(7):
+        label = WEEKDAYS[wd] if wd in (0, 2, 4) else ""
+        row = []
+        for w in range(weeks):
+            day = start + datetime.timedelta(weeks=w, days=wd)
+            if day > today:
+                row.append("  ")
+            else:
+                row.append(heat_cell(p, by_day.get(day, 0), thresholds))
+        out.line("  " + p(pad(label, 5), fg=DIM) + "".join(row))
+    legend = (p("less ", fg=DIM) + heat_cell(p, 0, thresholds)
+              + "".join(heat_cell(p, t, thresholds) for t in [thresholds[0], thresholds[1], thresholds[2], thresholds[2] + 1])
+              + p("more", fg=DIM))
+    if by_day:
+        best_day, best = max(by_day.items(), key=lambda kv: kv[1])
+        legend += p("    busiest %s (%s)" % (best_day.strftime("%a %b %d"), fmt_dur(best)), fg=DIM)
+    out.line("       " + legend)
+
+
+def render_hours(out, by_hour, wall):
+    p = out.paint
+    grid = collections.Counter()
+    for (day, hour), sec in by_hour.items():
+        grid[(day.weekday(), hour)] += sec
+    thresholds = levels(grid.values())
+    out.section("When", "wall-clock time by weekday and hour, local time")
+    marks = [" "] * 48
+    for h in (0, 6, 12, 18):
+        label = "%d" % h
+        marks[h * 2:h * 2 + len(label)] = list(label)
+    out.line("       " + p("".join(marks).rstrip(), fg=DIM))
+    for wd in range(7):
+        row = "".join(heat_cell(p, grid.get((wd, h), 0), thresholds) for h in range(24))
+        total = sum(grid.get((wd, h), 0) for h in range(24))
+        out.line("  " + p(pad(WEEKDAYS[wd], 5), fg=DIM) + row + " " + p(pad(fmt_dur(total), 7, True), fg=DIM))
+    if wall:
+        hours = collections.Counter()
+        for (_, h), sec in grid.items():
+            hours[h] += sec
+        peak = max(hours.items(), key=lambda kv: kv[1])[0] if hours else 0
+        weekend = sum(sec for (wd, _), sec in grid.items() if wd >= 5)
+        night = sum(sec for (_, h), sec in grid.items() if h >= 22 or h < 6)
+        out.line("       " + p("peak %02d:00–%02d:00 · weekends %s · nights (22–06) %s" % (
+            peak, (peak + 1) % 24, fmt_pct(weekend, wall), fmt_pct(night, wall)), fg=DIM))
+
+
+def render_lengths(out, timed, idle):
+    p = out.paint
+    buckets = [collections.Counter() for _ in LENGTH_BUCKETS]
+    for s in timed:
+        for i, (_, limit) in enumerate(LENGTH_BUCKETS):
+            if limit is None or s.active < limit:
+                buckets[i][s.tool] += 1
+                break
+    tools = sorted({s.tool for s in timed}, key=lambda t: -sum(1 for s in timed if s.tool == t))
+    biggest = max(sum(b.values()) for b in buckets) or 1
+    out.section("Session lengths", "active time; gaps over %s count as idle" % fmt_dur(idle))
+    bar_w = max(10, out.width - 22)
+    for (label, _), b in zip(LENGTH_BUCKETS, buckets):
+        n = sum(b.values())
+        width = int(round(float(n) / biggest * bar_w))
+        parts = [(b[t], tool_color(t)) for t in tools]
+        out.line("  " + p(pad(label, 8), fg=DIM) + stacked(p, parts, width, total=n) + " " + p(str(n), fg=DIM))
+    lens = sorted(s.active for s in timed)
+    top = max(timed, key=lambda s: s.active)
+    out.line("  " + p("median %s · mean %s · longest %s (%s)" % (
+        fmt_dur(lens[len(lens) // 2]), fmt_dur(sum(lens) / len(lens)), fmt_dur(top.active), top.tool), fg=DIM))
+
+
+def render_tokens(out, rep, all_tokens, top):
+    p = out.paint
+    total = sum(all_tokens)
+    out.section("Tokens", "%s total, as the tools recorded them" % fmt_num(total))
+    out.line("  " + stacked(p, [(v, c) for v, (_, _, c) in zip(all_tokens, TOKEN_PARTS)], out.width - 4))
+    out.wrap([p("■", fg=c) + " " + label + " " + p(fmt_num(v), bold=True)
+              for v, (_, label, c) in zip(all_tokens, TOKEN_PARTS)], sep="   ")
+    models = sorted(rep.models.items(), key=lambda kv: sum(kv[1]), reverse=True)
+    if not models:
+        return
+    name_w = min(28, max(len(m) for m, _ in models[:top]) + 2)
+    # name, total 8, output 9, gap 2, bar, then the tool dots and names.
+    bar_w = max(6, out.width - name_w - 46)
+    biggest = sum(models[0][1])
+    out.line()
+    out.line(p("  " + pad("model", name_w) + pad("total", 8, True) + pad("output", 9, True)
+               + "  " + pad("", bar_w) + " tools", fg=DIM))
+    for model, values in models[:top]:
+        tot = sum(values)
+        parts = [(v, c) for v, (_, _, c) in zip(values, TOKEN_PARTS)]
+        width = max(1, int(round(float(tot) / biggest * bar_w)))
+        tools = sorted(rep.model_tools[model])
+        dots = "".join(p("●", fg=tool_color(t)) for t in tools)
+        names = ellipsize(", ".join(tools), max(out.width - name_w - bar_w - 25 - len(tools), 0))
+        out.line("  " + pad(ellipsize(model, name_w - 2), name_w) + pad(fmt_num(tot), 8, True)
+                 + pad(fmt_num(values[3]), 9, True) + "  " + pad(stacked(p, parts, width, total=tot), bar_w)
+                 + " " + dots + " " + p(names, fg=DIM))
+    if len(models) > top:
+        rest = models[top:]
+        out.note("… %s more, %s" % (count(len(rest), "model"), count(sum(sum(v) for _, v in rest), "token")))
+
+
+def render_projects(out, scan, rep, sessions, now, top):
+    p = out.paint
+    per = {}
+    for s in sessions:
+        t = per.setdefault(s.project, {"n": 0, "time": 0.0, "tools": collections.Counter(), "last": 0})
+        t["n"] += 1
+        t["time"] += s.active
+        t["tools"][s.tool] += 1
+        t["last"] = max(t["last"], s.end or 0)
+    if not per:
+        return
+    home = os.path.expanduser("~")
+    order = sorted(per.items(), key=lambda kv: (kv[1]["time"], kv[1]["n"]), reverse=True)
+    out.section("Projects", "top %d of %d by session time" % (min(top, len(order)), len(order)))
+    # path, tools 6, sessions 9, time 10, tokens 9, gap 2, last used 11.
+    path_w = max(14, out.width - 49)
+    out.line(p("  " + pad("project", path_w) + pad("tools", 6) + pad("sessions", 9, True)
+               + pad("time", 10, True) + pad("tokens", 9, True) + "  last used", fg=DIM))
+    for phash, t in order[:top]:
+        path = scan.projects.get(phash) or ("(%s)" % phash)
+        if path.startswith(home + os.sep):
+            path = "~" + path[len(home):]
+        dots = "".join(p("●", fg=tool_color(tool)) for tool, _ in t["tools"].most_common(5))
+        tokens = sum(rep.project_tokens.get(phash, zero_tokens()))
+        out.line("  " + pad(ellipsize(path, path_w - 2, left=True), path_w) + pad(dots, 6)
+                 + pad(str(t["n"]), 9, True) + pad(fmt_dur(t["time"]) if t["time"] else "–", 10, True)
+                 + pad(fmt_num(tokens) if tokens else "–", 9, True) + "  " + p(fmt_ago(t["last"], now), fg=DIM))
+
+
+def render_habits(out, scan, rep, sessions):
+    p = out.paint
+    lines = []
+    extra = sum(scan.stores.values())
+    if extra:
+        lines.append(("Parallel stores", "%s besides default (concurrent, named, or worktree sessions)" % count(extra, "config store")))
+    if scan.memory:
+        files = sum(scan.memory.values())
+        projects = len(set().union(*scan.memory_projects.values()))
+        detail = ", ".join("%s %d" % (t, n) for t, n in scan.memory.most_common())
+        lines.append(("Agent memory", "%s in %s (%s)" % (count(files, "file"), count(projects, "project"), detail)))
+    if scan.shell_lines:
+        lines.append(("Shell", "%s in enclave shell history" % count(sum(scan.shell_lines.values()), "command")))
+    if rep.subagents:
+        lines.append(("Subagents", "%s subagent transcripts, counted within their sessions" % " · ".join(
+            "%s %d" % (k, n) for k, n in sorted(rep.subagents.items(), key=lambda kv: (-kv[1], kv[0])))))
+    setup = config_summary(scan.roots["config"])
+    if setup:
+        lines.append(("Setup", setup))
+    if not lines:
+        return
+    out.section("Habits & setup")
+    for label, text in lines:
+        for i, chunk in enumerate(textwrap.wrap(text, max(out.width - 19, 20))):
+            out.line("  " + p(pad(label if i == 0 else "", 17), fg=DIM) + chunk)
+
+
+def config_summary(config_root):
+    parts = []
+    ext = os.path.join(config_root, "extensions")
+    for kind in ("features", "tools"):
+        n = len(list_dirs(os.path.join(ext, kind)))
+        if n:
+            parts.append("%d user %s" % (n, kind if n != 1 else kind[:-1]))
+    for kind in ("host", "session"):
+        d = os.path.join(config_root, "commands", kind)
+        try:
+            with os.scandir(d) as it:
+                n = sum(1 for e in it if e.is_file() and os.access(e.path, os.X_OK))
+        except OSError:
+            n = 0
+        if n:
+            parts.append("%d %s command%s" % (n, kind, "s" if n != 1 else ""))
+    n = len(list_dirs(os.path.join(config_root, "skills")))
+    if n:
+        parts.append("%d shared skill%s" % (n, "s" if n != 1 else ""))
+    return " · ".join(parts)
+
+
+def render_network(out, scan, rep, top):
+    p = out.paint
+    net = rep.net
+    kinds = net["kinds"]
+    total = sum(n for (k, _, _), n in kinds.items() if k != "session")
+    if not total and not net["starts"]:
+        return
+    denied = sum(n for (k, v, _), n in kinds.items() if k != "session" and v == "deny")
+    out.section("Network", "gateway sessions only; sessions without a gateway leave no log")
+    modes = ", ".join("%s ×%d" % (m, n) for m, n in scan.gateways.most_common())
+    gateways = sum(scan.gateways.values())
+    out.wrap([count(net["starts"], "gateway session start"),
+              count(gateways, "gateway") + (" " + p("(" + modes + ")", fg=DIM) if modes else "")])
+    if total:
+        bar_w = max(10, out.width - 38)
+        out.line("  " + stacked(p, [(total - denied, ALLOW), (denied, DENY)], bar_w) + "  "
+                 + p(fmt_pct(total - denied, total) + " allowed", fg=ALLOW) + " · "
+                 + p(fmt_num(denied) + " denied", fg=DENY))
+    http = sum(n for (k, _, _), n in kinds.items() if k == "http")
+    conns = sum(n for (k, _, _), n in kinds.items() if k == "tcp")
+    dns = sum(n for (k, _, _), n in kinds.items() if k == "dns")
+    out.wrap(["%s (↑ %s ↓ %s)" % (count(http, "HTTP request"), fmt_bytes(net["req_bytes"]), fmt_bytes(net["resp_bytes"])),
+              count(conns, "TCP connection"), count(dns, "DNS denial")], fg=DIM)
+    errors = sum(n for (k, _, r), n in kinds.items() if r == "upstream-error")
+    if net["status"]:
+        codes = ["%s %s" % (c, fmt_num(n)) for c, n in sorted(net["status"].items())]
+        codes[0] = "status " + codes[0]
+        out.wrap(codes + ([count(errors, "upstream error")] if errors else []), fg=DIM)
+
+    allowed = net["allowed"].most_common(top)
+    denied_domains = collections.Counter()
+    deny_rules = collections.defaultdict(collections.Counter)
+    for (domain, rule), n in net["denied"].items():
+        denied_domains[domain] += n
+        deny_rules[domain][rule] += n
+    blocked = denied_domains.most_common(top)
+    col = (out.width - 4) // 2 if out.width >= 96 else out.width - 2
+    left = domain_rows(p, "allowed", allowed, ALLOW, col)
+    right = domain_rows(p, "denied", [(d, n, deny_rules[d].most_common(1)[0][0]) for d, n in blocked], DENY, col)
+    out.line()
+    if out.width >= 96:
+        for i in range(max(len(left), len(right))):
+            a = left[i] if i < len(left) else ""
+            b = right[i] if i < len(right) else ""
+            out.line("  " + pad(a, col) + "  " + b)
+    else:
+        for row in left + [""] + right:
+            out.line("  " + row)
+
+
+def domain_rows(p, title, rows, color, width):
+    if not rows:
+        return []
+    lines = [p("top " + title, fg=DIM)]
+    name_w = min(30, max(len(r[0]) for r in rows) + 1)
+    # name, bar, count 6, and the deny rule (up to 15) after it.
+    bar_w = max(4, width - name_w - 24)
+    biggest = rows[0][1]
+    for r in rows:
+        domain, n = r[0], r[1]
+        note = (" " + p(r[2], fg=DIM)) if len(r) > 2 else ""
+        lines.append(pad(ellipsize(domain, name_w - 1), name_w) + pad(bar(p, n, biggest, bar_w, color), bar_w)
+                     + " " + fmt_num(n) + note)
+    return lines
+
+
+def render_disk(out, rep):
+    p = out.paint
+    if not rep.disk:
+        return
+    state = sum(v[0] for v in rep.disk.values())
+    cache = sum(v[1] for v in rep.disk.values())
+    out.section("Disk", "%s state · %s cache" % (fmt_bytes(state), fmt_bytes(cache)))
+    rows = sorted(rep.disk.items(), key=lambda kv: sum(kv[1]), reverse=True)
+    biggest = sum(rows[0][1]) or 1
+    name_w = max(10, min(24, max(len(r[0]) for r in rows) + 3))
+    bar_w = max(10, out.width - name_w - 34)
+    out.line("  " + p("■", fg=ACCENT) + " state  " + p("■", fg=FAINT + 6) + " cache")
+    for name, (st, ca) in rows:
+        if st + ca < 1 << 20:
+            continue
+        width = max(1, int(round(float(st + ca) / biggest * bar_w)))
+        color = tool_color(name) if not name.startswith("(") else DIM
+        label = (p("●", fg=color) + " " + name) if not name.startswith("(") else "  " + p(name, fg=DIM)
+        out.line("  " + pad(label, name_w) + pad(stacked(p, [(st, ACCENT), (ca, FAINT + 6)], width, total=st + ca), bar_w)
+                 + " " + pad(fmt_bytes(st + ca), 6, True) + p("  (%s + %s)" % (fmt_bytes(st), fmt_bytes(ca)), fg=DIM))
+
+
+# --------------------------------------------------------------------------
+# Entry point
+
+
+USAGE = """\
+Usage: enclave stats [options]
+
+How, when, and how much you use Enclave, from the state it keeps on this
+machine: sessions, active time, and tokens per tool, model, and project; an
+activity calendar and weekday/hour heatmap; and what the network gateway saw.
+
+Options:
+  --since <when>     count only activity from then on: a date (2026-09-01) or
+                     a span back from now (7d, 4w, 3m, 1y)
+  --tool <name>      only this tool; repeatable, or comma-separated
+  --project <text>   only projects whose path contains text
+  --top <n>          rows in the model and project lists (default 8)
+  --idle <minutes>   gap after which a session counts as idle (default %(idle)d)
+  --disk             add disk usage of the state and cache roots; walks every
+                     file, so it can take a while on a big cache
+  --color <when>     auto (default), always, or never; NO_COLOR is honoured
+  --state-dir <dir>  read this state root instead of Enclave's own
+  -h, --help         this message
+
+Sessions and tokens come from each tool's own transcripts in its config
+store, so they cover sessions with and without a network gateway: Claude Code
+and Codex JSONL, Pi session files, OpenCode's database, and Mistral Vibe's
+session metadata. Subagents count toward the session that started them.
+Antigravity conversations and Pi's experimental durable sessions are counted,
+but hold no timing or tokens this command reads. A tool with no transcripts
+at all is counted from the gateway's session-start events, which miss every
+session it ran without a gateway. The report marks both.
+
+Session time is active time: the gaps between a session's events, where any
+gap longer than --idle is a break rather than work. Wall-clock time is the
+union of all sessions, so parallel sessions count once; the ratio of the two
+is how many sessions ran at once on average. Tokens are deduplicated by
+message id, since forks and subagents replay their parent's history, and are
+split into uncached input, cache reads, cache writes, and output as each tool
+reports them. Ephemeral sessions delete their stores and are not counted.
+
+Nothing under the state, config, or cache roots is modified. Credential
+stores (env/, auth/, secrets/, tls/) and the tools' auth files are never
+opened; OpenCode's database, which also keeps its account tokens, is queried
+for sessions and messages only. Databases are opened immutable, or read from a
+private temporary copy while their write-ahead log holds data, so a running
+tool is never disturbed. The running-now count asks 'enclave ps --json', and
+is left out with --state-dir.
+
+Defined in: %(path)s
+"""
+
+
+def parse_since(value):
+    m = re.match(r"^(\d+)([dwmy])$", value.strip())
+    if m:
+        days = int(m.group(1)) * {"d": 1, "w": 7, "m": 30, "y": 365}[m.group(2)]
+        today = datetime.date.today()
+        start = today - datetime.timedelta(days=days - 1)
+        return time.mktime(start.timetuple())
+    try:
+        d = datetime.datetime.strptime(value.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a date like 2026-09-01 or a span like 7d, 4w, 3m, 1y") from None
+    return time.mktime(d.timetuple())
+
+
+def positive_int(value):
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive number") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError("expected a positive number")
+    return n
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="enclave stats", usage="enclave stats [options]", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--since", type=parse_since)
+    parser.add_argument("--tool", action="append", default=[])
+    parser.add_argument("--project")
+    parser.add_argument("--top", type=positive_int, default=8)
+    parser.add_argument("--idle", type=positive_int, default=IDLE_DEFAULT_MINUTES)
+    parser.add_argument("--disk", action="store_true")
+    parser.add_argument("--color", choices=("auto", "always", "never"), default="auto")
+    parser.add_argument("--state-dir")
+    args = parser.parse_args(argv)
+    args.idle *= 60
+    args.tools = {t.strip() for v in args.tool for t in v.split(",") if t.strip()}
+    if args.color == "auto":
+        args.color = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+                      and os.environ.get("TERM") != "dumb")
+    else:
+        args.color = args.color == "always"
+    # Honours COLUMNS, then asks the terminal, then falls back to 100.
+    args.width = max(64, min(shutil.get_terminal_size((100, 24)).columns, 120))
+    return args
+
+
+def running_sessions():
+    """Containers enclave reports as running, or None when it cannot say."""
+    enclave = os.environ.get("ENCLAVE_BIN") or "enclave"
+    try:
+        proc = subprocess.run([enclave, "ps", "--json"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or b"[]")
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return [c for c in data if isinstance(c, dict) and c.get("status") == "running"]
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args.help:
+        sys.stdout.write(USAGE % {"idle": IDLE_DEFAULT_MINUTES, "path": os.path.abspath(sys.argv[0])})
+        return 0
+    started = time.time()
+    roots = default_roots()
+    if args.state_dir:
+        roots["state"] = os.path.abspath(os.path.expanduser(args.state_dir))
+    if not os.path.isdir(roots["state"]):
+        sys.stderr.write("No Enclave state directory at %s.\n" % roots["state"])
+        return 1
+
+    scan = Scan(roots, args.tools, args.project, args.since, args.disk)
+    running = None
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    tmpdir = tempfile.mkdtemp(prefix="enclave-stats-", dir=runtime if runtime and real_dir(runtime) else None)
+    try:
+        discover(scan, tmpdir)
+        results = run_jobs(scan.jobs)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if not args.state_dir:
+        running = running_sessions()
+        if running is not None:
+            running = [c for c in running
+                       if (not args.tools or c.get("tool") in args.tools)
+                       and (not args.project or args.project in str(c.get("projectDir") or ""))]
+    rep = aggregate(scan, results, args.idle)
+    text = render(scan, rep, args, running, time.time() - started)
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Piped into head: the reader has what it wanted.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
